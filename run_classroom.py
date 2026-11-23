@@ -33,6 +33,7 @@ import random
 import sys
 import time
 import warnings
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -77,6 +78,13 @@ EDGE_MARGIN_FRAC = 0.01            # boxes this close to the frame edge are trun
 PENDING_SEC = 3.0                  # new ID whose first crop was occluded/cut off stays provisional this long and is
                                    #   re-tested (same MIN_SIM/MAX_DIST rule) on clean crops; merged if it passes
 PENDING_RETEST_SEC = 0.25          # how often a provisional ID is re-embedded and re-tested
+LONG_ABSENCE_SEC = 600.0           # after REMAP_WINDOW_SEC a missing ID stays reclaimable this long, but only with
+LONG_MIN_SIM = 0.93                #   this stricter similarity AND reappearing where it vanished or in its home seat
+SEAT_DWELL_SEC = 5.0               # staying within SEAT_RADIUS this long marks a seat; longest-held seat = home seat
+SEAT_RADIUS = 0.6                  # m
+SEAT_MATCH_DIST = 0.75             # m: a newcomer settling this close to a missing ID's home seat is compared with it
+SEAT_CLAIM_WINDOW_SEC = 180.0      # a newcomer can be merged into a missing ID (seat rule) up to this long after it
+                                   #   first appeared
 DRIFT_SIM = 0.80                   # refresh below this sim to its own gallery = "appearance drift": logged, not merged
 MIN_CROP_PX = 16                   # don't embed crops smaller than this (either side)
 
@@ -256,16 +264,20 @@ def to_floor(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 class FloorSmoother:
-    """Per-stable-ID EMA on floor positions."""
+    """Per-stable-ID EMA on floor positions. Restarts after a gap (e.g. an ID reclaimed somewhere else)."""
 
-    def __init__(self, alpha: float = RADAR_EMA_ALPHA):
-        self.alpha = alpha
+    def __init__(self, alpha: float = RADAR_EMA_ALPHA, reset_sec: float = 1.0):
+        self.alpha, self.reset_sec = alpha, reset_sec
         self.pos: dict[int, np.ndarray] = {}
+        self.last_t: dict[int, float] = {}
 
-    def update(self, sid: int, xy: np.ndarray) -> np.ndarray:
+    def update(self, sid: int, xy: np.ndarray, t: float) -> np.ndarray:
         prev = self.pos.get(sid)
-        cur = np.asarray(xy, dtype=np.float64) if prev is None else (1 - self.alpha) * prev + self.alpha * xy
-        self.pos[sid] = cur
+        if prev is None or t - self.last_t.get(sid, t) > self.reset_sec:
+            cur = np.asarray(xy, dtype=np.float64)
+        else:
+            cur = (1 - self.alpha) * prev + self.alpha * xy
+        self.pos[sid], self.last_t[sid] = cur, t
         return cur
 
 
@@ -478,22 +490,39 @@ class Identity:
     gallery: Optional[np.ndarray] = None
     n_gallery: int = 0
     last_embed_t: float = -1e9
-    floor: Optional[np.ndarray] = None       # last smoothed floor position (m)
+    floor: Optional[np.ndarray] = None       # last smoothed floor position (m) = where it was last seen
+    entry_floor: Optional[np.ndarray] = None # first floor position (where it appeared)
     raw_ids: list = field(default_factory=list)
     frames_seen: int = 0
     drifting: bool = False
     provisional_until: float = -1.0          # > t while the ID is provisional (first crop was not clean)
+    pos_hist: deque = field(default_factory=deque)   # recent (t, floor xy) for stillness / seat detection
+    last_floor_t: Optional[float] = None
+    still_at: Optional[np.ndarray] = None    # where it is currently standing/sitting still, else None
+    seats: list = field(default_factory=list)  # [[center xy, dwell seconds], ...]
+    last_seat_check_t: float = -1e9
+
+    @property
+    def home_seat(self) -> Optional[np.ndarray]:
+        """The place this ID stayed still the longest (at least SEAT_DWELL_SEC)."""
+        best = max(self.seats, key=lambda s: s[1], default=None)
+        return best[0] if best is not None and best[1] >= SEAT_DWELL_SEC else None
 
 
 class IdentityManager:
     """Maps raw tracker IDs to stable anonymous IDs.
 
-    A new raw ID may reclaim a stable ID that is NOT active in this frame, was last seen within REMAP_WINDOW_SEC,
-    has cosine similarity >= MIN_SIM between the new crop's embedding and its gallery, and whose last floor
-    position is within MAX_DIST. Multiple new raw IDs in one frame are matched jointly (Hungarian, max similarity).
-    Otherwise a new stable ID is created. If that new ID's first crop was occluded or cut off (unreliable evidence),
-    it is provisional for PENDING_SEC: it is re-tested with the same rule on clean crops and merged into the lost ID
-    if it passes. One SigLIP forward pass per frame embeds all needed crops."""
+    A new raw tracker ID may reclaim a stable ID that is not visible now and vanished before this person appeared
+    (two people seen at the same time are never merged):
+      - short rule: missing <= REMAP_WINDOW_SEC, cosine similarity >= MIN_SIM, and within MAX_DIST of where it was
+        last seen;
+      - long rule: missing <= LONG_ABSENCE_SEC, similarity >= LONG_MIN_SIM, and appearing within MAX_DIST of where
+        it was last seen (e.g. back through the same door or frame edge);
+      - seat rule: a newcomer (first seen <= SEAT_CLAIM_WINDOW_SEC ago) who settles within SEAT_MATCH_DIST of a
+        missing ID's home seat and whose gallery matches with similarity >= LONG_MIN_SIM is merged into it.
+    Multiple new raw IDs in one frame are matched jointly (Hungarian, max similarity); otherwise a new stable ID is
+    created. If its first crop was occluded or cut off, it is provisional for PENDING_SEC and re-tested on clean
+    crops. One SigLIP forward pass per frame embeds all needed crops."""
 
     def __init__(self, embedder: AppearanceEmbedder):
         self.embedder = embedder
@@ -503,8 +532,9 @@ class IdentityManager:
         self.all_raw_ids: set[int] = set()
         self.remaps: list[dict] = []
         self.events: list[dict] = []           # identity_new / identity_remap / appearance_drift
-        self.merged: dict[int, int] = {}       # provisional stable ID -> stable ID it was merged into
+        self.merged: dict[int, int] = {}       # stable ID -> stable ID it was later merged into
 
+    # ---- helpers ----
     def _gallery_update(self, ident: Identity, emb: np.ndarray) -> None:
         if ident.gallery is None:
             ident.gallery, ident.n_gallery = emb.copy(), 1
@@ -514,20 +544,64 @@ class IdentityManager:
         ident.gallery = g / (np.linalg.norm(g) + 1e-12)
         ident.n_gallery += 1
 
-    def _lost_candidates(self, active: set[int], t: float) -> list[Identity]:
-        return [d for d in self.ids.values() if d.sid not in active and d.gallery is not None
-                and d.floor is not None and t - d.last_t <= REMAP_WINDOW_SEC]
+    def _gate(self, d: Identity, sim: float, pos_now: np.ndarray, pos_entry: np.ndarray, t: float,
+              appeared_t: float, active: set[int]) -> tuple[bool, float, str]:
+        """Can lost ID `d` be reclaimed by a person who appeared at `appeared_t` (entry position pos_entry, now at
+        pos_now) with appearance similarity `sim`? Returns (ok, distance used, rule)."""
+        if d.sid in active or d.gallery is None or d.floor is None or d.last_t > appeared_t + 1e-6:
+            return False, float("inf"), ""
+        dist = float(min(np.linalg.norm(pos_now - d.floor), np.linalg.norm(pos_entry - d.floor)))
+        gap = t - d.last_t
+        if gap <= REMAP_WINDOW_SEC and sim >= MIN_SIM and dist <= MAX_DIST:
+            return True, dist, "short"
+        if gap <= LONG_ABSENCE_SEC and sim >= LONG_MIN_SIM and dist <= MAX_DIST:
+            return True, dist, "long"
+        return False, dist, ""
 
-    def _log_remap(self, frame_idx: int, t: float, raw: int, ident: Identity, sim: float, dist: float, **extra):
-        gap = t - ident.last_t
+    def _log_remap(self, frame_idx: int, t: float, raw: int, ident: Identity, sim: float, dist: float,
+                   rule: str, merged_id: Optional[int] = None, young: Optional[Identity] = None):
+        gap = t - ident.last_t if young is None else young.first_t - ident.last_t
         ev = dict(type="identity_remap", frame=frame_idx, t=round(t, 3), raw_id=raw, stable_id=ident.sid,
-                  similarity=round(sim, 4), distance_m=round(dist, 3), gap_sec=round(gap, 3), **extra)
+                  rule=rule, similarity=round(sim, 4), distance_m=round(dist, 3), gap_sec=round(gap, 3))
+        if merged_id is not None:
+            ev.update(deferred=True, merged_id=merged_id, merged_after_sec=round(t - young.first_t, 3))
         self.remaps.append(ev)
         self.events.append(ev)
-        how = f" (deferred: provisional #{extra['provisional_id']} merged)" if extra else ""
-        log(f"[remap] frame {frame_idx} t={t:.2f}s raw {raw} -> stable {ident.sid} "
-            f"(sim {sim:.3f}, dist {dist:.2f} m, gap {gap:.1f}s){how}")
+        how = f"; temporary #{merged_id} merged after {t - young.first_t:.1f}s" if merged_id is not None else ""
+        log(f"[remap:{rule}] frame {frame_idx} t={t:.2f}s raw {raw} -> stable {ident.sid} "
+            f"(sim {sim:.3f}, dist {dist:.2f} m, missing {gap:.1f}s{how})")
 
+    def _merge(self, young: Identity, into: Identity, raw: int, frame_idx: int, t: float, sim: float,
+               dist: float, rule: str, emb: Optional[np.ndarray]) -> None:
+        """Merge a recently created ID into the lost ID it turned out to be."""
+        for rr in [rr for rr, s in self.raw_to_sid.items() if s in (into.sid, young.sid)]:
+            del self.raw_to_sid[rr]
+        self._log_remap(frame_idx, t, raw, into, sim, dist, rule, merged_id=young.sid, young=young)
+        self.merged[young.sid] = into.sid
+        del self.ids[young.sid]
+        self.raw_to_sid[raw] = into.sid
+        into.raw_ids.append(raw)
+        into.frames_seen += young.frames_seen
+        into.drifting = False
+        into.last_embed_t = t
+        into.pos_hist, into.still_at, into.last_floor_t = young.pos_hist, young.still_at, young.last_floor_t
+        for center, dwell in young.seats:
+            self._add_dwell(into, center, dwell)
+        if emb is not None:
+            self._gallery_update(into, emb)
+
+    @staticmethod
+    def _add_dwell(ident: Identity, center: np.ndarray, dwell: float) -> None:
+        for s in ident.seats:
+            if np.linalg.norm(s[0] - center) <= SEAT_RADIUS:
+                total = s[1] + dwell
+                if total > 0:
+                    s[0] = (s[0] * s[1] + center * dwell) / total
+                s[1] = total
+                return
+        ident.seats.append([np.asarray(center, dtype=np.float64).copy(), dwell])
+
+    # ---- per-frame update ----
     def update(self, frame_idx: int, t: float, frame: np.ndarray, raw_ids: np.ndarray, xyxy: np.ndarray,
                kp_xy: np.ndarray, kp_conf: np.ndarray, floor_raw: np.ndarray,
                occluders: Optional[np.ndarray] = None) -> np.ndarray:
@@ -584,22 +658,23 @@ class IdentityManager:
             ident.drifting = False
             self._gallery_update(ident, e)
 
-        # ---- new raw IDs: reclaim a lost stable ID or create a new one ----
+        # ---- new raw IDs: reclaim a lost stable ID (short / long rule) or create a new one ----
         if new_idx:
-            cands = self._lost_candidates(active, t)
+            cands = [d for d in self.ids.values() if d.sid not in active and d.gallery is not None
+                     and d.floor is not None and t - d.last_t <= max(REMAP_WINDOW_SEC, LONG_ABSENCE_SEC)]
             S = np.full((len(new_idx), len(cands)), -1.0)
             D = np.full((len(new_idx), len(cands)), np.inf)
+            ok = np.zeros((len(new_idx), len(cands)), dtype=bool)
+            rule = np.full((len(new_idx), len(cands)), "", dtype=object)
             for a, i in enumerate(new_idx):
                 e = emb_of.get(i)
                 for b, d in enumerate(cands):
-                    D[a, b] = float(np.linalg.norm(floor_raw[i] - d.floor))
-                    if e is not None:
-                        S[a, b] = float(d.gallery @ e)
-            feasible = (S >= MIN_SIM) & (D <= MAX_DIST)
+                    S[a, b] = float(d.gallery @ e) if e is not None else -1.0
+                    ok[a, b], D[a, b], rule[a, b] = self._gate(d, S[a, b], floor_raw[i], floor_raw[i], t, t, active)
             matched: dict[int, int] = {}
-            if feasible.any():
-                rows, cols = linear_sum_assignment(np.where(feasible, 1.0 - S, 1e6))
-                matched = {int(r): int(c) for r, c in zip(rows, cols) if feasible[r, c]}
+            if ok.any():
+                rows, cols = linear_sum_assignment(np.where(ok, 1.0 - S, 1e6))
+                matched = {int(r): int(c) for r, c in zip(rows, cols) if ok[r, c]}
             for a, i in enumerate(new_idx):
                 raw = int(raw_ids[i])
                 e = emb_of.get(i)
@@ -607,10 +682,13 @@ class IdentityManager:
                     ident = cands[matched[a]]
                     for rr in [rr for rr, s in self.raw_to_sid.items() if s == ident.sid]:
                         del self.raw_to_sid[rr]  # retire the old raw ID; if it comes back it is re-matched
-                    self._log_remap(frame_idx, t, raw, ident, float(S[a, matched[a]]), float(D[a, matched[a]]))
+                    self._log_remap(frame_idx, t, raw, ident, float(S[a, matched[a]]), float(D[a, matched[a]]),
+                                    str(rule[a, matched[a]]))
                     if e is not None and not bad[i]:
                         self._gallery_update(ident, e)
                     ident.drifting = False
+                    ident.pos_hist.clear()
+                    ident.still_at = None
                 else:
                     ident = Identity(sid=self.next_sid, first_t=t, last_t=t, last_frame=frame_idx)
                     self.next_sid += 1
@@ -622,10 +700,11 @@ class IdentityManager:
                         ident.provisional_until = t + PENDING_SEC
                     ev = dict(type="identity_new", frame=frame_idx, t=round(t, 3), raw_id=raw, stable_id=ident.sid,
                               provisional=not clean)
-                    if len(cands):  # best rejected candidate, for tuning MIN_SIM / MAX_DIST
+                    if len(cands):  # closest rejected candidate (prefer ones within MAX_DIST), for tuning
                         b = int(np.argmax(np.where(D[a] <= MAX_DIST, S[a], S[a] - 10)))
                         ev.update(best_candidate=cands[b].sid, best_sim=round(float(S[a, b]), 4),
-                                  best_dist_m=round(float(D[a, b]), 3))
+                                  best_dist_m=round(float(D[a, b]), 3),
+                                  best_missing_sec=round(float(t - cands[b].last_t), 2))
                     self.events.append(ev)
                 ident.last_embed_t = t
                 ident.raw_ids.append(raw)
@@ -633,38 +712,54 @@ class IdentityManager:
                 sids[i] = ident.sid
                 active.add(ident.sid)
 
-        # ---- deferred re-check of provisional IDs on clean crops (same MIN_SIM / MAX_DIST rule) ----
+        # ---- deferred re-check of provisional IDs on clean crops (short / long rule, from where they appeared) ----
         for i in pending_idx:
             prov = self.ids[sids[i]]
             prov.last_embed_t = t
             e = emb_of.get(i)
             if e is None:
                 continue
+            entry = prov.entry_floor if prov.entry_floor is not None else floor_raw[i]
             best = None
-            for d in self._lost_candidates(active, t):
-                sim, dist = float(d.gallery @ e), float(np.linalg.norm(floor_raw[i] - d.floor))
-                if sim >= MIN_SIM and dist <= MAX_DIST and (best is None or sim > best[1]):
-                    best = (d, sim, dist)
+            for d in self.ids.values():
+                if d.sid == prov.sid or d.gallery is None:
+                    continue
+                sim = float(d.gallery @ e)
+                good, dist, r = self._gate(d, sim, floor_raw[i], entry, t, prov.first_t, active)
+                if good and (best is None or sim > best[1]):
+                    best = (d, sim, dist, r)
             if best is None:
                 self._gallery_update(prov, e)  # clean evidence for the provisional ID itself
                 continue
-            ident, sim, dist = best
-            raw = int(raw_ids[i])
-            for rr in [rr for rr, s in self.raw_to_sid.items() if s in (ident.sid, prov.sid)]:
-                del self.raw_to_sid[rr]
-            self._log_remap(frame_idx, t, raw, ident, sim, dist, deferred=True, provisional_id=prov.sid,
-                            provisional_sec=round(t - prov.first_t, 3))
-            self.merged[prov.sid] = ident.sid
-            del self.ids[prov.sid]
-            self.raw_to_sid[raw] = ident.sid
-            ident.raw_ids.append(raw)
-            ident.frames_seen += prov.frames_seen
-            ident.drifting = False
-            ident.last_embed_t = t
-            self._gallery_update(ident, e)
+            ident, sim, dist, r = best
+            self._merge(prov, ident, int(raw_ids[i]), frame_idx, t, sim, dist, r, e)
             active.discard(prov.sid)
             active.add(ident.sid)
             sids[i] = ident.sid
+
+        # ---- seat rule: a newcomer settling in a missing ID's home seat, with matching clothing ----
+        for i in range(n):
+            young = self.ids[sids[i]]
+            if (young.still_at is None or young.gallery is None or young.n_gallery < 3
+                    or t - young.first_t > SEAT_CLAIM_WINDOW_SEC or t - young.last_seat_check_t < 0.5):
+                continue
+            young.last_seat_check_t = t
+            best = None
+            for d in self.ids.values():
+                home = d.home_seat
+                if (d.sid in active or d.gallery is None or home is None or d.last_t > young.first_t + 1e-6
+                        or t - d.last_t > LONG_ABSENCE_SEC):
+                    continue
+                dist = float(np.linalg.norm(young.still_at - home))
+                sim = float(d.gallery @ young.gallery)
+                if dist <= SEAT_MATCH_DIST and sim >= LONG_MIN_SIM and (best is None or sim > best[1]):
+                    best = (d, sim, dist)
+            if best is not None:
+                ident, sim, dist = best
+                self._merge(young, ident, int(raw_ids[i]), frame_idx, t, sim, dist, "seat", None)
+                active.discard(young.sid)
+                active.add(ident.sid)
+                sids[i] = ident.sid
 
         for i in range(n):
             ident = self.ids[sids[i]]
@@ -672,8 +767,35 @@ class IdentityManager:
             ident.frames_seen += 1
         return sids
 
-    def set_floor(self, sid: int, xy: np.ndarray) -> None:
-        self.ids[sid].floor = np.asarray(xy, dtype=np.float64)
+    def set_floor(self, sid: int, xy: np.ndarray, t: float) -> None:
+        """Record the smoothed floor position; detects standing/sitting still and accumulates seat dwell time."""
+        ident = self.ids[sid]
+        xy = np.asarray(xy, dtype=np.float64)
+        ident.floor = xy
+        if ident.entry_floor is None:
+            ident.entry_floor = xy.copy()
+        h = ident.pos_hist
+        h.append((t, xy))
+        while h and t - h[0][0] > SEAT_DWELL_SEC:
+            h.popleft()
+        dt = 0.0 if ident.last_floor_t is None else min(t - ident.last_floor_t, 1.0)
+        ident.last_floor_t = t
+        ident.still_at = None
+        if t - h[0][0] >= 0.9 * SEAT_DWELL_SEC:
+            pts = np.array([p for _, p in h])
+            med = np.median(pts, axis=0)
+            if float(np.max(np.linalg.norm(pts - med, axis=1))) <= SEAT_RADIUS:
+                ident.still_at = med
+                if not any(np.linalg.norm(s[0] - med) <= SEAT_RADIUS for s in ident.seats):
+                    self._add_dwell(ident, med, SEAT_DWELL_SEC)  # credit the whole stillness window once
+                else:
+                    self._add_dwell(ident, med, dt)
+
+    def resolve(self, sid: int) -> int:
+        """Final stable ID after all merges (merges can chain)."""
+        while sid in self.merged:
+            sid = self.merged[sid]
+        return sid
 
 
 # =====================================================================================================
@@ -1118,8 +1240,8 @@ def main() -> int:
             sids = idm.update(frame_idx, t, frame, raw_ids, xyxy, kp_xy, kp_conf, floor_raw, occluders)
             positions: dict[int, np.ndarray] = {}
             for i, sid in enumerate(sids):
-                positions[int(sid)] = smoother.update(int(sid), floor_raw[i])
-                idm.set_floor(int(sid), positions[int(sid)])
+                positions[int(sid)] = smoother.update(int(sid), floor_raw[i], t)
+                idm.set_floor(int(sid), positions[int(sid)], t)
 
             # ---------------- raised hands ----------------
             hand_up = {int(sid): hands.update(int(sid), hand_up_pose(kp_xy[i], kp_conf[i]), t, frame_idx)
@@ -1174,8 +1296,8 @@ def main() -> int:
         writer.release()
         tracks_csv.close()
         hands.close_all(frame_idx / fps, frame_idx)
-        if idm.merged:  # rewrite provisional IDs that were later merged into their final stable ID
-            merged = {str(k): str(v) for k, v in idm.merged.items()}
+        if idm.merged:  # rewrite temporary IDs that were later merged into their final stable ID
+            merged = {str(k): str(idm.resolve(k)) for k in idm.merged}
             path = out_dir / f"{video.stem}_tracks.csv"
             with open(path, newline="") as fh:
                 rows = list(csv.reader(fh))
@@ -1185,13 +1307,16 @@ def main() -> int:
                 csv.writer(fh).writerows(rows)
             for kf in keyframes:
                 for person in kf["people"]:
-                    person["id"] = idm.merged.get(person["id"], person["id"])
+                    person["id"] = idm.resolve(person["id"])
+                    if person.get("attuned_to_id") is not None:
+                        person["attuned_to_id"] = idm.resolve(person["attuned_to_id"])
 
         events = sorted(idm.events + hands.events + possible_swaps + vlm_events, key=lambda e: (e["frame"], e["type"]))
         summary = dict(
             frames_processed=frame_idx, seconds_processed=round(frame_idx / fps, 3),
             raw_tracker_ids=len(idm.all_raw_ids), stable_ids=len(idm.ids), remaps=len(idm.remaps),
             deferred_remaps=len(idm.merged),
+            remaps_by_rule={r: sum(e.get("rule") == r for e in idm.remaps) for r in ("short", "long", "seat")},
             appearance_drift_events=sum(e["type"] == "appearance_drift" for e in idm.events),
             hand_raise_events=sum(e["type"] == "hand_raise_start" for e in hands.events),
             gemini_status=vlm_status,
@@ -1210,7 +1335,7 @@ def main() -> int:
                                        frames_seen=d.frames_seen, raw_ids=d.raw_ids,
                                        appearance=labeler.memory.get(sid) if labeler else None)
                         for sid, d in sorted(idm.ids.items())},
-            merged_provisional_ids={str(k): v for k, v in idm.merged.items()},  # already applied to tracks CSV
+            merged_ids={str(k): idm.resolve(k) for k in idm.merged},  # already applied to tracks CSV/keyframes
             summary=summary,
         )
         events_path = out_dir / f"{video.stem}_events.json"
@@ -1221,8 +1346,9 @@ def main() -> int:
         log(f"SUMMARY  ({summary['seconds_processed']:.1f}s, {frame_idx} frames, {tracker_desc})")
         log(f"  total raw tracker IDs      : {summary['raw_tracker_ids']}")
         log(f"  total stable IDs           : {summary['stable_ids']}")
-        log(f"  identity remaps            : {summary['remaps']}"
-            + (f"  ({summary['deferred_remaps']} deferred: provisional ID merged)" if idm.merged else ""))
+        by_rule = ", ".join(f"{k} {v}" for k, v in summary["remaps_by_rule"].items() if v)
+        log(f"  identity remaps            : {summary['remaps']}" + (f"  ({by_rule})" if by_rule else "")
+            + (f"; {summary['deferred_remaps']} temporary IDs merged" if idm.merged else ""))
         log(f"  Gemini id_mismatch flags   : {summary['gemini_id_mismatch_flags']}")
         log(f"  failed Gemini calls        : {summary['gemini_failed']} / {summary['gemini_calls']} attempted"
             f"  [{vlm_status}]")

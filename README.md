@@ -94,20 +94,32 @@ homography is written instead and a warning is printed. Edit it, because `MAX_DI
   - Not updated from crops whose similarity to the ID's own gallery drops below `DRIFT_SIM`. That is logged as
     `appearance_drift` (a possible swap), and the gallery stays frozen so it can't absorb the wrong person.
 - **New raw tracker IDs** are embedded immediately. All crops in a frame go through one batched forward pass.
-  Each new raw ID is compared with stable IDs that are **not active** in this frame and were last seen within
-  `REMAP_WINDOW_SEC`. It reclaims the most similar one that passes both gates:
-  - cosine similarity `>= MIN_SIM`
-  - floor distance to that ID's last position `<= MAX_DIST`
+  Each new raw ID is compared with stable IDs that are **not visible now** and **vanished before this person
+  appeared**, so two people who were ever on screen together are never merged. It reclaims the most similar one
+  that passes one of these rules:
+
+  | rule | missing for | similarity | position |
+  |---|---|---|---|
+  | `short` | `<= REMAP_WINDOW_SEC` (30 s) | `>= MIN_SIM` (0.90) | within `MAX_DIST` of where it was last seen |
+  | `long` | `<= LONG_ABSENCE_SEC` (10 min) | `>= LONG_MIN_SIM` (0.93) | appears within `MAX_DIST` of where it vanished (same door or frame edge) |
 
   Otherwise it gets a new stable ID. Several new raw IDs in one frame are matched jointly (Hungarian).
-  Every remap is logged with frame, raw ID, stable ID, similarity, distance and gap.
+  Every remap is logged with its rule, frame, raw ID, stable ID, similarity, distance and how long it was missing.
+- **Home seats.** Each ID records where it stands or sits still for at least `SEAT_DWELL_SEC` (within
+  `SEAT_RADIUS`). The place held longest is its **home seat**.
+  - `seat` rule: a newcomer who settles within `SEAT_MATCH_DIST` of a missing ID's home seat, within
+    `SEAT_CLAIM_WINDOW_SEC` of appearing, is merged into that ID if their clothing galleries match with similarity
+    `>= LONG_MIN_SIM`.
+  - This covers a student who leaves through one door, comes back minutes later through another, and sits down
+    in their usual seat.
 - **Provisional IDs.** A person often comes back half-hidden behind whoever was in front of them, and that first
   crop is too contaminated to match. When the crop is occluded or cut off by the frame edge, the new ID is
   **provisional** for `PENDING_SEC`:
   - It is re-tested every `PENDING_RETEST_SEC` on clean crops, using the same `MIN_SIM` + `MAX_DIST` rule.
   - If it passes, it is merged into the lost ID. That counts as a remap with `deferred: true`.
-  - Merged provisional IDs are rewritten in the tracks CSV and keyframes, and listed under
-    `merged_provisional_ids`. The annotated video may show the provisional number for up to `PENDING_SEC`.
+- **Late merges** (provisional or `seat` rule) are applied to the tracks CSV and keyframes at the end of the run,
+  and listed under `merged_ids` in the events JSON. The annotated video is written live, so it shows the temporary
+  number until the merge happens.
 - **Gemini** keeps a short appearance note per stable ID and sees the stored notes in each prompt.
   - When it reports `id_mismatch`, the event is logged as a possible swap and the stored note is **not**
     overwritten.
@@ -131,6 +143,7 @@ All tunables are constants at the top of `run_classroom.py`. Start from the even
 | `best_dist_m` just above `MAX_DIST` | fix the floor calibration first, then raise `MAX_DIST` (1.5 -> 2.0 m) |
 | gap longer than `REMAP_WINDOW_SEC` | raise `REMAP_WINDOW_SEC` (seated students are safe to keep for 60 s+) |
 | person came back partly hidden, crop is a mix of two people | raise `PENDING_SEC` (3 -> 5 s) so the provisional ID gets more time to show a clean crop |
+| person left the room and came back much later as a new ID | check `best_missing_sec` / `best_sim`: raise `LONG_ABSENCE_SEC`, or lower `LONG_MIN_SIM` a little (not below `MIN_SIM`); for seated classes check that `home seat` positions are stable (calibration) and raise `SEAT_MATCH_DIST` slightly |
 | no `best_*` fields (no candidate) | the lost ID was still "active" or had no gallery: raise `LOST_TRACK_BUFFER_SEC` (2 -> 3-4 s) so the tracker bridges the gap itself |
 
 Also worth trying:
@@ -147,6 +160,10 @@ Signs: Gemini `possible_swap` events, `appearance_drift` events, or a remap with
 - Lower `REMAP_WINDOW_SEC`.
 - Raise `DRIFT_SIM` (freeze galleries sooner) and/or lower `GALLERY_EMA` (galleries adapt more slowly).
 - Lower `PENDING_SEC` (or set it to 0 to disable deferred re-checks) if provisional IDs merge into the wrong person.
+- If people who left are later merged with someone else (`rule: long` or `rule: seat` remaps that look wrong in
+  `tools/identity_audit.py`): raise `LONG_MIN_SIM`, lower `SEAT_MATCH_DIST`, or shorten `LONG_ABSENCE_SEC` /
+  `SEAT_CLAIM_WINDOW_SEC`. Setting `LONG_ABSENCE_SEC = 0` and `SEAT_CLAIM_WINDOW_SEC = 0` turns the
+  re-entry rules off.
 - Lower `OCCLUDED_FRAC` so crops overlapping a neighbor never update a gallery.
 - For swaps between two tracks that never break (no new raw ID, so no remap can fix them):
   - raise `TRACK_ACTIVATION_THRESHOLD` and `TRACK_MIN_IOU`

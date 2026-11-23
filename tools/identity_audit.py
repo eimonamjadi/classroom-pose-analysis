@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Visual audit of the stable-ID layer.
 
-For every identity_remap event: crop of the stable ID when it was last seen  |  crop of the new raw track that
-reclaimed it (similarity, floor distance, gap). Wrong merges are obvious at a glance.
+For every identity_remap event (short / long / seat rule): crop of the stable ID when it was last seen  |  crop of
+the person who reclaimed it (similarity, floor distance, how long it was missing). Wrong merges are obvious at a glance.
 For every identity_new event that had a candidate: crop of the new person  |  crop of the best rejected candidate
 (best_sim, best_dist_m). Same person on both sides = a missed reclaim (too many new IDs).
 
@@ -21,6 +21,7 @@ import numpy as np
 video, out_dir = sys.argv[1], Path(sys.argv[2])
 stem = Path(video).stem
 events = json.loads((out_dir / f"{stem}_events.json").read_text())
+merged = events.get("merged_ids", events.get("merged_provisional_ids", {}))
 rows = defaultdict(dict)  # stable_id -> frame -> bbox
 for r in csv.DictReader(open(out_dir / f"{stem}_tracks.csv")):
     rows[int(r["stable_id"])][int(r["frame"])] = [float(r[k]) for k in ("x1", "y1", "x2", "y2")]
@@ -59,18 +60,22 @@ tiles = []
 for e in events["events"]:
     if e["type"] == "identity_remap":
         sid, f = e["stable_id"], e["frame"]
-        lf, lbox = last_before(sid, f)
+        # for a late merge the newcomer's earlier rows already carry the final ID: look before it appeared
+        cutoff = f - int(round(e.get("merged_after_sec", 0) * fps)) if e.get("deferred") else f
+        lf, lbox = last_before(sid, cutoff)
         left = crop(lf, lbox) if lf is not None else np.zeros((H, H // 2, 3), np.uint8)
         right = crop(f, rows[sid].get(f))
-        t = (f"REMAP raw {e['raw_id']} -> #{sid}  t={e['t']:.1f}s\n"
-             f"sim {e['similarity']:.3f}  dist {e['distance_m']:.2f}m  gap {e['gap_sec']:.1f}s")
+        t = (f"REMAP ({e.get('rule', 'short')}) raw {e['raw_id']} -> #{sid}  t={e['t']:.1f}s\n"
+             f"sim {e['similarity']:.3f}  dist {e['distance_m']:.2f}m  missing {e['gap_sec']:.1f}s")
         tiles.append(tile(left, right, t, (120, 255, 120)))
     elif e["type"] == "identity_new" and "best_candidate" in e and e["frame"] > 0:
         sid, f, cand = e["stable_id"], e["frame"], e["best_candidate"]
+        final = merged.get(str(sid), sid)  # the CSV already carries the final ID of merged newcomers
         lf, lbox = last_before(cand, f)
-        left = crop(f, rows[sid].get(f))
+        left = crop(f, rows[final].get(f))
         right = crop(lf, lbox) if lf is not None else np.zeros((H, H // 2, 3), np.uint8)
-        t = (f"NEW #{sid} (raw {e['raw_id']}) t={e['t']:.1f}s | best rejected #{cand}\n"
+        tag = f" (later merged into #{final})" if final != sid else ""
+        t = (f"NEW #{sid}{tag} t={e['t']:.1f}s | best rejected #{cand}\n"
              f"sim {e['best_sim']:.3f}  dist {e['best_dist_m']:.2f}m")
         tiles.append(tile(left, right, t, (120, 200, 255)))
 
