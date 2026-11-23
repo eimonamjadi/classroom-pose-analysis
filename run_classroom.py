@@ -87,6 +87,7 @@ SEAT_CLAIM_WINDOW_SEC = 180.0      # a newcomer can be merged into a missing ID 
                                    #   first appeared
 DRIFT_SIM = 0.80                   # refresh below this sim to its own gallery = "appearance drift": logged, not merged
 MIN_CROP_PX = 16                   # don't embed crops smaller than this (either side)
+MIN_ID_SEC = 1.0                   # summary also counts stable IDs visible at least this long (filters blips)
 
 # --- raised hand ---
 HAND_UP_SEC = 0.5                  # wrist-above-nose AND elbow-above-shoulder must hold this long to be reported
@@ -1314,7 +1315,9 @@ def main() -> int:
         events = sorted(idm.events + hands.events + possible_swaps + vlm_events, key=lambda e: (e["frame"], e["type"]))
         summary = dict(
             frames_processed=frame_idx, seconds_processed=round(frame_idx / fps, 3),
-            raw_tracker_ids=len(idm.all_raw_ids), stable_ids=len(idm.ids), remaps=len(idm.remaps),
+            raw_tracker_ids=len(idm.all_raw_ids), stable_ids=len(idm.ids),
+            stable_ids_visible_min=sum(d.frames_seen >= MIN_ID_SEC * fps for d in idm.ids.values()),
+            remaps=len(idm.remaps),
             deferred_remaps=len(idm.merged),
             remaps_by_rule={r: sum(e.get("rule") == r for e in idm.remaps) for r in ("short", "long", "seat")},
             appearance_drift_events=sum(e["type"] == "appearance_drift" for e in idm.events),
@@ -1345,7 +1348,8 @@ def main() -> int:
         log("=" * 64)
         log(f"SUMMARY  ({summary['seconds_processed']:.1f}s, {frame_idx} frames, {tracker_desc})")
         log(f"  total raw tracker IDs      : {summary['raw_tracker_ids']}")
-        log(f"  total stable IDs           : {summary['stable_ids']}")
+        log(f"  total stable IDs           : {summary['stable_ids']}"
+            f"  ({summary['stable_ids_visible_min']} visible >= {MIN_ID_SEC:g}s)")
         by_rule = ", ".join(f"{k} {v}" for k, v in summary["remaps_by_rule"].items() if v)
         log(f"  identity remaps            : {summary['remaps']}" + (f"  ({by_rule})" if by_rule else "")
             + (f"; {summary['deferred_remaps']} temporary IDs merged" if idm.merged else ""))
