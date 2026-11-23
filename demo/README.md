@@ -17,9 +17,19 @@ The floor calibration for this clip was estimated by eye, so radar depth is comp
 - `demo_identical_vests_36s.mp4` and `filmstrips_identical_vests.jpg`: two workers in identical vests and hard
   hats walking side by side keep separate IDs; newcomers in the same outfit are not merged into earlier workers.
 
+- `demo_reentry_classroom_away50s.mp4` and `filmstrips_reentry_classroom.jpg`: the left-back student is out of view
+  from 10 s to 60 s (grey panel) and gets his original ID (#2) back when he reappears, 50 s later, through the
+  long-absence rule.
+- `demo_reentry_walkout_back60s.mp4`: a woman walks out of frame, the room is empty for 60 s, and she walks back in
+  through the same edge. Her temporary ID is merged back into #1 1.2 s after she reappears.
+- `filmstrips_negative_same_spot.jpg` and `filmstrips_negative_same_doors.jpg`: six and seven **different** people
+  using the same table / doors keep separate IDs. Nobody inherits the ID of someone who left.
+
 All demos were produced with the current code (default ByteTrack + stable-ID layer).
 
-**Attribution:** source footage is `classroom.mp4`, `store-aisle-detection.mp4` and `worker-zone-detection.mp4` from
+**Attribution:** source footage is `classroom.mp4`, `store-aisle-detection.mp4`, `worker-zone-detection.mp4`,
+`one-by-one-person-detection.mp4` and `people-detection.mp4` from
 [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos), licensed
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Changes: trimmed (and for the aisle/worker clips resampled to 30 fps and resized), annotated with tracking
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Changes: trimmed or re-edited (re-entry clips: segments masked, slowed, reversed or brightened; aisle/worker
+clips resampled to 30 fps and resized), annotated with tracking
 overlays and a radar panel, downscaled and re-encoded.

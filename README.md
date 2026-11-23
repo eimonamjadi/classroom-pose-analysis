@@ -202,6 +202,19 @@ ID next to its best candidate).
 | same, `--tracker botsort_reid` | same | 6 | 7 | 6 | 1 (deferred) | 0 | 0 |
 | `worker-zone-detection.mp4` 14-50 s | two people in identical vests and hard hats side by side; re-entries | 4 appearances | 4 | 4 | 0 | 0 | 0 |
 
+**Leaving the frame and coming back** (long-absence and seat rules):
+
+| clip | what it tests | people | raw tracker IDs | stable IDs | remaps | wrong merges |
+|---|---|---|---|---|---|---|
+| P1: classroom, one student out of view for 50 s, then back in his seat (frames after the return were never seen before) | return after more than the 30 s window | 4 | 5 | 4 | 1 (`long`, sim 0.939, 0.16 m) | 0 |
+| P2: `one-by-one-person-detection.mp4`, a woman walks out of frame, the room is empty for 60 s, she walks back in through the same edge | walk-out / walk-in | 1 | 3 | 1 (+1 one-frame blip) | 1 (`long`, sim 0.974, 0.09 m) | 0 |
+| N1: `one-by-one-person-detection.mp4` (139 s, unmodified) | 6 **different** people take turns at the same table, 3-54 s apart, two look-alike pairs | 6 | 6 | 6 | 0 | 0 |
+| N2: `people-detection.mp4` (50 s, unmodified) | 7 different people using the same doors, similar outfits | 7 | 7 | 7 | 0 | 0 |
+
+P1 and P2 are built from real footage; there was no public clip of the same person leaving and returning. P2's
+return is the original walk played in reverse with brighter lighting, so its appearance match is easier than in
+real life. In N1/N2 the closest different-person similarity was 0.80 (well below `LONG_MIN_SIM` = 0.93).
+
 Reference run summary (classroom, first 30 s): raw tracker IDs 4, stable IDs 4, remaps 0, Gemini `id_mismatch`
 flags 0, failed Gemini calls 0 / 0 (disabled).
 
