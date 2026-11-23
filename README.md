@@ -51,6 +51,7 @@ python run_classroom.py --video input_videos/class.mp4 --max-seconds 30 --tracke
 | `--calibrate` | force interactive floor calibration |
 | `--no-vlm` | skip Gemini |
 | `--siglip ID_OR_DIR` | SigLIP model id or local directory |
+| `--set NAME=VALUE` | override any tunable constant for this run, e.g. `--set MIN_SIM=0.88 --set SKELETON_BG=faded` (repeatable; constants derived from others, like `STATE_TTL_SEC`, are not recomputed) |
 
 At the end the script prints: total raw tracker IDs, total stable IDs, identity remaps, Gemini `id_mismatch`
 flags, and failed Gemini calls.
@@ -72,18 +73,70 @@ homography is written instead and a warning is printed. Edit it, because `MAX_DI
 ## Outputs (in `--out`)
 
 - `<video>_annotated.mp4`: boxes, skeletons, `#ID role:behavior` labels, `HAND UP` badges; floor radar underneath
-  (dot = student, square = teacher, red ring = hand raised, arrow = attending to).
+  (dot = student, square = teacher, red ring = hand raised, arrow = attending to, thin line = last
+  `TRAIL_SEC` of movement).
+- `<video>_skeletons.mp4`: skeletons only, with ID labels and fading movement trails, on black (no faces or
+  background; `SKELETON_BG = "faded"` shows a dimmed frame behind them).
 - `<video>_events.json`:
   - `summary`
   - `keyframes`: per-keyframe Gemini labels with floor position and hand state.
   - `events`: chronological `identity_new`, `identity_remap`, `appearance_drift`, `possible_swap`,
     `hand_raise_start` / `hand_raise_end`, `vlm_error`.
   - `remaps`, `possible_swaps`
-  - `identities`: per stable ID, which raw IDs it absorbed, time span and last appearance note.
+  - `identities`: per stable ID, which raw IDs it absorbed, time span, home seat and last appearance note.
   - `config`: every tunable, as used for the run.
-- `<video>_tracks.csv`: one row per person per frame, with columns
-  `frame, t, stable_id, raw_id, bbox, conf, floor_x, floor_y, anchor_mode, hand_raised`.
+- `<video>_tracks.csv`: one row per person per frame (final stable IDs; late merges already applied):
+
+  | columns | meaning |
+  |---|---|
+  | `frame, t, stable_id, raw_id` | time and identity |
+  | `x1, y1, x2, y2, conf` | person box (pixels) and detector confidence |
+  | `floor_x, floor_y` | smoothed floor position (m); `floor_x_raw, floor_y_raw` unsmoothed |
+  | `anchor_x, anchor_y, anchor_mode` | image point used as the ground contact, and how it was estimated (`ankle` / `hip` / `box`) |
+  | `speed_mps, heading_deg, dist_cum_m` | speed over the last second, direction of travel (degrees, 0 = +x), distance travelled so far |
+  | `still, dist_home_seat_m` | standing/sitting still now (0/1); distance to this ID's home seat |
+  | `hand_raised` | raised hand (after the `HAND_UP_SEC` hold) |
+  | `occluded_frac, truncated, provisional` | box covered by another detection; cut off by the frame edge; ID still provisional |
+  | `role, behavior, attuned_to_id, appearance` | latest Gemini labels if fresher than `STATE_TTL_SEC` |
+  | `nose_x, nose_y, nose_conf, ... r_ankle_conf` | all 17 COCO keypoints (pixels + confidence) |
+
+  Distances and speeds are in floor meters, so they are only as good as the floor calibration.
+- `<video>_id_summary.csv`: one row per stable ID:
+  - time on screen: `first_t`, `last_t`, `visible_sec`, `frames`;
+  - identity: absorbed `raw_tracker_ids`, `remaps`;
+  - movement: `total_distance_m`, `mean_speed_mps`, `p95_speed_mps`, `moving_sec`, `still_sec`, mean position;
+  - seat: home seat and `sec_at_home_seat`;
+  - hands: `hand_raises`, `hand_raised_sec`;
+  - Gemini: most common `role`, `top_attention_id`, `appearance`, and seconds spent in each behavior
+    (`behavior_sec_*`).
+- `<video>_trajectories_floor.png`: every ID's path on the floor plan, with start (o), end (filled) and home seat
+  ([]).
+- `<video>_trajectories_camera.png`: the same paths drawn over the first frame, in camera view.
+- `<video>_heatmap_floor.png`: where people spent their time on the floor.
 - `vlm_keyframes/`: the exact tagged JPEGs sent to Gemini, for auditing `id_mismatch` flags.
+
+## Running in the cloud
+
+The pipeline runs anywhere Python and (ideally) an NVIDIA GPU are available. On a GPU it is many times faster
+than on CPU.
+
+- **Google Colab (easiest):** open `cloud/run_on_colab.ipynb` in Colab and pick a GPU runtime. Add the secrets
+  `GEMINI_API_KEY` (and `GITHUB_TOKEN` while this repo is private), point it at a Google Drive folder of videos,
+  and run all cells. Outputs go back to Drive. Colab can't open the click-to-calibrate window, so the notebook
+  has a cell to enter the 4 floor points instead.
+- **Any cloud GPU VM** (Google Cloud, AWS, Azure, Lambda, RunPod, ...) with a recent NVIDIA driver:
+
+  ```bash
+  git clone https://github.com/eimonamjadi/classroom-pose-analysis && cd classroom-pose-analysis
+  pip install -r requirements.txt
+  export GEMINI_API_KEY=...
+  python run_classroom.py --video class.mp4 --out output/class --calib floor_calib.json
+  ```
+
+  Calibrate once on a machine with a display (`--calibrate`), or write `floor_calib.json` by hand, then copy it to
+  the VM.
+
+The script uses CUDA automatically when available, for both YOLO and SigLIP.
 
 ## How stable IDs work
 

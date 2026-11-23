@@ -97,6 +97,13 @@ RADAR_EMA_ALPHA = 0.3              # per-ID EMA on floor positions (anchor mode 
 HIP_TO_FLOOR = 1.0                 # hip-mode anchor: drop the hip midpoint by this x torso length (px)
 RADAR_HEIGHT_FRAC = 0.5            # radar panel height as a fraction of the video frame height
 RADAR_PAD_M = 0.5                  # radar shows the calibrated floor area plus this margin (m)
+TRAIL_SEC = 10.0                   # movement trails on the radar and skeleton video cover this many seconds
+
+# --- extra outputs ---
+SAVE_SKELETON_VIDEO = True         # also write <video>_skeletons.mp4 (skeletons + trails, no faces/background)
+SKELETON_BG = "black"              # "black" or "faded" (dimmed video behind the skeletons)
+MOVE_DEADBAND_M = 0.15             # distance travelled only counts steps larger than this (filters jitter)
+MOVING_SPEED_MPS = 0.3             # per-ID summary: faster than this counts as moving
 
 # --- VLM (Gemini) ---
 VLM_ENABLED = True                 # also requires GEMINI_API_KEY / GOOGLE_API_KEY; --no-vlm disables
@@ -314,10 +321,15 @@ class FloorRadar:
         return img
 
     def render(self, positions: dict[int, np.ndarray], hand_raised: dict[int, bool],
-               states: dict[int, "PersonState"]) -> np.ndarray:
-        """All inputs keyed by stable ID."""
+               states: dict[int, "PersonState"], trails: Optional[dict[int, list]] = None) -> np.ndarray:
+        """All inputs keyed by stable ID. trails: {id: [(t, xy), ...]} recent floor positions."""
         img = self.base.copy()
         r = max(5, int(self.h / 70))
+        for sid, pts in (trails or {}).items():  # movement trails (broken at gaps)
+            color = tuple(int(c * 0.7) for c in id_color(sid))
+            for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+                if t1 - t0 <= 1.0:
+                    cv2.line(img, self.to_px(p0), self.to_px(p1), color, 1, cv2.LINE_AA)
         for sid, st in states.items():  # attention arrows first (underneath dots)
             if st is None or sid not in positions:
                 continue
@@ -1107,6 +1119,235 @@ def draw_annotations(frame: np.ndarray, people: list[dict], states: dict[int, Pe
 
 
 # =====================================================================================================
+# Extra outputs: motion stats, skeleton video, trajectory maps, per-ID summary
+# =====================================================================================================
+KP_NAMES = ["nose", "l_eye", "r_eye", "l_ear", "r_ear", "l_shoulder", "r_shoulder", "l_elbow", "r_elbow",
+            "l_wrist", "r_wrist", "l_hip", "r_hip", "l_knee", "r_knee", "l_ankle", "r_ankle"]
+TRACK_COLUMNS = (["frame", "t", "stable_id", "raw_id", "x1", "y1", "x2", "y2", "conf",
+                  "floor_x", "floor_y", "floor_x_raw", "floor_y_raw", "anchor_x", "anchor_y", "anchor_mode",
+                  "speed_mps", "heading_deg", "dist_cum_m", "still", "dist_home_seat_m", "hand_raised",
+                  "occluded_frac", "truncated", "provisional", "role", "behavior", "attuned_to_id", "appearance"]
+                 + [f"{n}_{c}" for n in KP_NAMES for c in ("x", "y", "conf")])
+
+
+class MotionTracker:
+    """Per stable ID: speed over the last second, heading, and distance travelled (deadband filters jitter).
+    Nothing is counted across a gap (e.g. while the person was out of view)."""
+
+    def __init__(self):
+        self.hist: dict[int, deque] = {}
+        self.anchor: dict[int, np.ndarray] = {}
+        self.dist: dict[int, float] = {}
+
+    def update(self, sid: int, xy: np.ndarray, t: float) -> tuple[float, float, float]:
+        h = self.hist.setdefault(sid, deque())
+        if h and t - h[-1][0] > 1.0:  # gap: restart the window and the deadband anchor
+            h.clear()
+            self.anchor[sid] = xy.copy()
+        h.append((t, xy.copy()))
+        while t - h[0][0] > 1.0:
+            h.popleft()
+        dt = t - h[0][0]
+        d = xy - h[0][1]
+        speed = float(np.linalg.norm(d) / dt) if dt >= 0.3 else 0.0
+        heading = float(math.degrees(math.atan2(d[1], d[0]))) if speed > 0.1 else float("nan")
+        a = self.anchor.get(sid)
+        if a is None:
+            self.anchor[sid], self.dist[sid] = xy.copy(), 0.0
+        elif np.linalg.norm(xy - a) > MOVE_DEADBAND_M:
+            self.dist[sid] = self.dist.get(sid, 0.0) + float(np.linalg.norm(xy - a))
+            self.anchor[sid] = xy.copy()
+        return speed, heading, self.dist.get(sid, 0.0)
+
+
+def draw_skeleton_frame(frame: np.ndarray, people: list[dict], img_trails: dict[int, list], t: float) -> np.ndarray:
+    """Skeletons only (no faces/background unless SKELETON_BG='faded'), ID labels and movement trails."""
+    h, w = frame.shape[:2]
+    canvas = (frame * 0.25).astype(np.uint8) if SKELETON_BG == "faded" else np.zeros_like(frame)
+    lw = max(2, round(h / 300))
+    fs = max(0.5, h / 1400)
+    for sid, pts in img_trails.items():
+        color = id_color(sid)
+        for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+            if t1 - t0 > 1.0:
+                continue
+            fade = max(0.15, 1.0 - (t - t1) / TRAIL_SEC)
+            cv2.line(canvas, (int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])),
+                     tuple(int(c * fade) for c in color), max(1, lw - 1), cv2.LINE_AA)
+    for p in people:
+        color = id_color(p["sid"])
+        xy, c = p["kp_xy"], p["kp_conf"]
+        for a, b in SKELETON:
+            if c[a] > KP_CONF and c[b] > KP_CONF:
+                cv2.line(canvas, tuple(int(v) for v in xy[a]), tuple(int(v) for v in xy[b]), color, lw, cv2.LINE_AA)
+        for k in range(17):
+            if c[k] > KP_CONF:
+                cv2.circle(canvas, tuple(int(v) for v in xy[k]), lw + 1, (255, 255, 255), -1, cv2.LINE_AA)
+        ax, ay = head_anchor(p["box"], xy, c)
+        put_label(canvas, f"#{p['sid']}", (ax - 14, ay - 4), color, fs, max(1, lw // 2), (0, 0, 0))
+    put_label(canvas, f"t={t:6.2f}s  skeletons + {TRAIL_SEC:g}s trails", (8, int(30 * fs) + 8), (40, 40, 40), fs, 1)
+    return canvas
+
+
+def postprocess_tracks(path: Path, idm: "IdentityManager") -> list[dict]:
+    """Apply late merges to the per-frame CSV and recompute dist_cum_m per final stable ID."""
+    with open(path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    for r in rows:
+        r["stable_id"] = str(idm.resolve(int(r["stable_id"])))
+    rows.sort(key=lambda r: (int(r["frame"]), int(r["stable_id"])))
+    anchor, last_t, dist = {}, {}, {}
+    for r in rows:
+        sid, t, xy = r["stable_id"], float(r["t"]), np.array([float(r["floor_x"]), float(r["floor_y"])])
+        if sid not in anchor or t - last_t[sid] > 1.0:
+            anchor[sid] = xy
+            dist.setdefault(sid, 0.0)
+        elif np.linalg.norm(xy - anchor[sid]) > MOVE_DEADBAND_M:
+            dist[sid] += float(np.linalg.norm(xy - anchor[sid]))
+            anchor[sid] = xy
+        last_t[sid] = t
+        r["dist_cum_m"] = f"{dist[sid]:.3f}"
+    with open(path, "w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=TRACK_COLUMNS)
+        wr.writeheader()
+        wr.writerows(rows)
+    return rows
+
+
+def write_id_summary(rows: list[dict], idm: "IdentityManager", hands: "HandRaiseTracker", fps: float,
+                     memory: dict, path: Path) -> list[dict]:
+    """One row per stable ID with everything derivable from the per-frame data."""
+    by_sid: dict[str, list[dict]] = {}
+    for r in rows:
+        by_sid.setdefault(r["stable_id"], []).append(r)
+    behaviors = [b.value for b in Behavior]
+    out = []
+    for sid_s, rs in sorted(by_sid.items(), key=lambda kv: int(kv[0])):
+        sid = int(sid_s)
+        ident = idm.ids.get(sid)
+        xy = np.array([[float(r["floor_x"]), float(r["floor_y"])] for r in rs])
+        speed = np.array([float(r["speed_mps"]) for r in rs])
+        home = ident.home_seat if ident is not None else None
+        at_home = (np.linalg.norm(xy - home, axis=1) <= SEAT_RADIUS) if home is not None else np.zeros(len(rs), bool)
+        roles = [r["role"] for r in rs if r["role"]]
+        attn = [r["attuned_to_id"] for r in rs if r["attuned_to_id"]]
+        raises = [e for e in hands.events if e["type"] == "hand_raise_start" and idm.resolve(e["stable_id"]) == sid]
+        row = dict(
+            stable_id=sid, first_t=rs[0]["t"], last_t=rs[-1]["t"], visible_sec=round(len(rs) / fps, 2),
+            frames=len(rs), raw_tracker_ids=" ".join(map(str, ident.raw_ids)) if ident else "",
+            remaps=sum(e["stable_id"] == sid for e in idm.remaps),
+            total_distance_m=rs[-1]["dist_cum_m"],
+            mean_speed_mps=round(float(speed.mean()), 3), p95_speed_mps=round(float(np.percentile(speed, 95)), 3),
+            moving_sec=round(float((speed > MOVING_SPEED_MPS).sum()) / fps, 2),
+            still_sec=round(sum(r["still"] == "1" for r in rs) / fps, 2),
+            mean_floor_x=round(float(xy[:, 0].mean()), 3), mean_floor_y=round(float(xy[:, 1].mean()), 3),
+            home_seat_x=round(float(home[0]), 3) if home is not None else "",
+            home_seat_y=round(float(home[1]), 3) if home is not None else "",
+            sec_at_home_seat=round(float(at_home.sum()) / fps, 2),
+            hand_raises=len(raises), hand_raised_sec=round(sum(r["hand_raised"] == "1" for r in rs) / fps, 2),
+            role=max(set(roles), key=roles.count) if roles else "",
+            top_attention_id=max(set(attn), key=attn.count) if attn else "",
+            appearance=memory.get(sid, ""),
+        )
+        for b in behaviors:
+            row[f"behavior_sec_{b}"] = round(sum(r["behavior"] == b for r in rs) / fps, 2)
+        out.append(row)
+    if out:
+        with open(path, "w", newline="") as fh:
+            wr = csv.DictWriter(fh, fieldnames=list(out[0].keys()))
+            wr.writeheader()
+            wr.writerows(out)
+    return out
+
+
+def write_trajectory_maps(rows: list[dict], idm: "IdentityManager", calib: dict, first_frame: np.ndarray,
+                          out_dir: Path, stem: str) -> list[Path]:
+    """Floor-plan trajectories, camera-view trajectories and a floor occupancy heatmap (PNG)."""
+    by_sid: dict[int, list[dict]] = {}
+    for r in rows:
+        by_sid.setdefault(int(r["stable_id"]), []).append(r)
+    ext = radar_extent(calib)
+    aspect = (ext[3] - ext[1]) / max(ext[2] - ext[0], 1e-3)
+    W = 1200
+    radar = FloorRadar(ext, W, int(np.clip(W * aspect, 500, 1600)) + 60)
+    paths = []
+
+    def segments(rs, kx, ky):
+        seg, last = [], None
+        for r in rs:
+            t = float(r["t"])
+            if last is not None and t - last > 1.0 and seg:
+                yield seg
+                seg = []
+            seg.append((float(r[kx]), float(r[ky])))
+            last = t
+        if seg:
+            yield seg
+
+    # floor plan
+    img = radar.base.copy()
+    put_label(img, f"movement trajectories (floor, m)  o start  * end  [] home seat", (8, 48), (28, 28, 28),
+              radar.fs * 0.8)
+    for sid, rs in sorted(by_sid.items()):
+        color = id_color(sid)
+        for seg in segments(rs, "floor_x", "floor_y"):
+            pts = np.array([radar.to_px(p) for p in seg], np.int32)
+            cv2.polylines(img, [pts], False, color, 2, cv2.LINE_AA)
+        s = radar.to_px((float(rs[0]["floor_x"]), float(rs[0]["floor_y"])))
+        e = radar.to_px((float(rs[-1]["floor_x"]), float(rs[-1]["floor_y"])))
+        cv2.circle(img, s, 7, color, 2, cv2.LINE_AA)
+        cv2.circle(img, e, 7, color, -1, cv2.LINE_AA)
+        home = idm.ids[sid].home_seat if sid in idm.ids else None
+        if home is not None:
+            hp = radar.to_px(home)
+            cv2.rectangle(img, (hp[0] - 10, hp[1] - 10), (hp[0] + 10, hp[1] + 10), color, 2)
+        cv2.putText(img, f"#{sid}", (e[0] + 9, e[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    p = out_dir / f"{stem}_trajectories_floor.png"
+    cv2.imwrite(str(p), img)
+    paths.append(p)
+
+    # camera view
+    img = (first_frame * 0.45).astype(np.uint8)
+    for sid, rs in sorted(by_sid.items()):
+        color = id_color(sid)
+        for seg in segments(rs, "anchor_x", "anchor_y"):
+            cv2.polylines(img, [np.array(seg, np.int32)], False, color, max(2, first_frame.shape[0] // 400), cv2.LINE_AA)
+        e = (int(float(rs[-1]["anchor_x"])), int(float(rs[-1]["anchor_y"])))
+        cv2.circle(img, e, 6, color, -1, cv2.LINE_AA)
+        put_label(img, f"#{sid}", (e[0] + 8, e[1] - 6), color, max(0.5, first_frame.shape[0] / 1400), 1, (0, 0, 0))
+    put_label(img, "movement trajectories (ground point, camera view)", (8, 30), (0, 0, 0),
+              max(0.5, first_frame.shape[0] / 1400), 1)
+    p = out_dir / f"{stem}_trajectories_camera.png"
+    cv2.imwrite(str(p), img)
+    paths.append(p)
+
+    # occupancy heatmap (time spent per 0.25 m cell)
+    cell = 0.25
+    nx, ny = max(1, int((ext[2] - ext[0]) / cell)), max(1, int((ext[3] - ext[1]) / cell))
+    grid = np.zeros((ny, nx), np.float32)
+    for r in rows:
+        gx = int((float(r["floor_x"]) - ext[0]) / cell)
+        gy = int((ext[3] - float(r["floor_y"])) / cell)
+        if 0 <= gx < nx and 0 <= gy < ny:
+            grid[gy, gx] += 1
+    if grid.max() > 0:
+        x0, y0 = radar.to_px((ext[0], ext[3]))
+        x1, y1 = radar.to_px((ext[2], ext[1]))
+        hm = cv2.GaussianBlur(cv2.resize(grid, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST), (0, 0), 6)
+        hm = (255 * np.sqrt(hm / hm.max())).astype(np.uint8)
+        colored = cv2.applyColorMap(hm, cv2.COLORMAP_INFERNO)
+        img = radar.base.copy()
+        roi = img[y0:y1, x0:x1]
+        mask = (hm > 8)[..., None]
+        img[y0:y1, x0:x1] = np.where(mask, cv2.addWeighted(roi, 0.3, colored, 0.7, 0), roi)
+        put_label(img, "occupancy heatmap (time spent on the floor)", (8, 48), (28, 28, 28), radar.fs * 0.8)
+        p = out_dir / f"{stem}_heatmap_floor.png"
+        cv2.imwrite(str(p), img)
+        paths.append(p)
+    return paths
+
+
+# =====================================================================================================
 # Main
 # =====================================================================================================
 def config_snapshot() -> dict:
@@ -1125,7 +1366,30 @@ def main() -> int:
     ap.add_argument("--tracker", choices=["bytetrack", "botsort_reid"], default=None, help=f"default: {TRACKER}")
     ap.add_argument("--no-vlm", action="store_true", help="skip Gemini labeling")
     ap.add_argument("--siglip", default=None, help=f"SigLIP model id or local dir (default: {SIGLIP_MODEL})")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="override a tunable constant for this run, e.g. --set MIN_SIM=0.88 (repeatable)")
     args = ap.parse_args()
+    overrides = {}
+    for item in args.set:
+        name, _, val = item.partition("=")
+        name = name.strip().upper()
+        cur = globals().get(name)
+        if not name.isupper() or cur is None or name in ("KP", "KP_NAMES", "SKELETON", "CALIB_HELP", "TRACK_COLUMNS") \
+                or not isinstance(cur, (bool, int, float, str, tuple)):
+            ap.error(f"--set: unknown tunable {name!r}")
+        if isinstance(cur, bool):
+            new = val.strip().lower() in ("1", "true", "yes", "on")
+        elif isinstance(cur, int):
+            new = int(float(val))
+        elif isinstance(cur, float):
+            new = float(val)
+        elif isinstance(cur, tuple):
+            new = tuple(type(cur[0])(x) for x in val.split(","))
+        else:
+            new = val
+        globals()[name] = overrides[name] = new
+    if overrides:
+        log(f"[config] overrides: {overrides}")
     TRACKER = args.tracker or TRACKER
     SIGLIP_MODEL = args.siglip or SIGLIP_MODEL
     if args.no_vlm:
@@ -1170,9 +1434,12 @@ def main() -> int:
     embedder = AppearanceEmbedder(SIGLIP_MODEL)
     log(f"[identity] SigLIP {SIGLIP_MODEL} on {embedder.device}")
     idm = IdentityManager(embedder)
-    smoother = FloorSmoother()
+    smoother = FloorSmoother(RADAR_EMA_ALPHA)
     hands = HandRaiseTracker()
-    cache = StateCache()
+    cache = StateCache(STATE_TTL_SEC)
+    motion = MotionTracker()
+    floor_trails: dict[int, deque] = {}
+    img_trails: dict[int, deque] = {}
 
     labeler, vlm_status = None, "disabled (--no-vlm)" if args.no_vlm else ""
     if VLM_ENABLED:
@@ -1191,10 +1458,13 @@ def main() -> int:
     radar = FloorRadar(radar_extent(calib), W, radar_h)
     out_video = out_dir / f"{video.stem}_annotated.mp4"
     writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H + radar_h))
-    tracks_csv = open(out_dir / f"{video.stem}_tracks.csv", "w", newline="")
+    skel_video = out_dir / f"{video.stem}_skeletons.mp4"
+    skel_writer = cv2.VideoWriter(str(skel_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)) \
+        if SAVE_SKELETON_VIDEO else None
+    tracks_path = out_dir / f"{video.stem}_tracks.csv"
+    tracks_csv = open(tracks_path, "w", newline="")
     tw = csv.writer(tracks_csv)
-    tw.writerow(["frame", "t", "stable_id", "raw_id", "x1", "y1", "x2", "y2", "conf",
-                 "floor_x", "floor_y", "anchor_mode", "hand_raised"])
+    tw.writerow(TRACK_COLUMNS)
 
     keyframes: list[dict] = []
     vlm_events: list[dict] = []
@@ -1240,9 +1510,21 @@ def main() -> int:
             floor_raw = to_floor(Hm, anchors)
             sids = idm.update(frame_idx, t, frame, raw_ids, xyxy, kp_xy, kp_conf, floor_raw, occluders)
             positions: dict[int, np.ndarray] = {}
+            moves: dict[int, tuple] = {}
             for i, sid in enumerate(sids):
-                positions[int(sid)] = smoother.update(int(sid), floor_raw[i], t)
-                idm.set_floor(int(sid), positions[int(sid)], t)
+                sid = int(sid)
+                positions[sid] = smoother.update(sid, floor_raw[i], t)
+                idm.set_floor(sid, positions[sid], t)
+                moves[sid] = motion.update(sid, positions[sid], t)
+                for trails, pt in ((floor_trails, positions[sid]), (img_trails, anchors[i])):
+                    dq = trails.setdefault(sid, deque())
+                    dq.append((t, np.asarray(pt, dtype=np.float64).copy()))
+            for trails in (floor_trails, img_trails):
+                for sid in list(trails):
+                    while trails[sid] and t - trails[sid][0][0] > TRAIL_SEC:
+                        trails[sid].popleft()
+                    if not trails[sid]:
+                        del trails[sid]
 
             # ---------------- raised hands ----------------
             hand_up = {int(sid): hands.update(int(sid), hand_up_pose(kp_xy[i], kp_conf[i]), t, frame_idx)
@@ -1278,14 +1560,33 @@ def main() -> int:
             header = (f"t={t:6.2f}s  people={len(people)}  hands={sum(hand_up.values())}  "
                       f"stable IDs={len(idm.ids)}  raw IDs={len(idm.all_raw_ids)}  remaps={len(idm.remaps)}")
             top = draw_annotations(frame, people, states, hand_up, header)
-            panel = radar.render(positions, hand_up, states)
+            panel = radar.render(positions, hand_up, states, {k: list(v) for k, v in floor_trails.items()})
             writer.write(np.vstack([top, panel]))
+            if skel_writer is not None:
+                skel_writer.write(draw_skeleton_frame(frame, people, {k: list(v) for k, v in img_trails.items()}, t))
 
+            occl = occlusion_fraction(xyxy, occluders) if len(people) else np.zeros(0)
+            trunc = truncated(xyxy, W, H) if len(people) else np.zeros(0, bool)
             for i, p in enumerate(people):
-                fx, fy = positions[p["sid"]]
-                tw.writerow([frame_idx, f"{t:.3f}", p["sid"], p["raw"], *(f"{v:.1f}" for v in p["box"]),
+                sid = p["sid"]
+                ident = idm.ids[sid]
+                fx, fy = positions[sid]
+                speed, heading, dist = moves[sid]
+                home = ident.home_seat
+                st = states.get(sid)
+                kps = [f"{v:.1f}" if j < 2 else f"{v:.3f}"
+                       for k in range(17) for j, v in enumerate((p["kp_xy"][k][0], p["kp_xy"][k][1], p["kp_conf"][k]))]
+                tw.writerow([frame_idx, f"{t:.3f}", sid, p["raw"], *(f"{v:.1f}" for v in p["box"]),
                              f"{float(dets.confidence[i]):.3f}" if dets.confidence is not None else "",
-                             f"{fx:.3f}", f"{fy:.3f}", modes[i], int(hand_up[p["sid"]])])
+                             f"{fx:.3f}", f"{fy:.3f}", f"{floor_raw[i][0]:.3f}", f"{floor_raw[i][1]:.3f}",
+                             f"{anchors[i][0]:.1f}", f"{anchors[i][1]:.1f}", modes[i],
+                             f"{speed:.3f}", "" if math.isnan(heading) else f"{heading:.0f}", f"{dist:.3f}",
+                             int(ident.still_at is not None),
+                             f"{np.linalg.norm(positions[sid] - home):.3f}" if home is not None else "",
+                             int(hand_up[sid]), f"{occl[i]:.2f}", int(trunc[i]), int(ident.provisional_until > t),
+                             st.role if st else "", st.behavior if st else "",
+                             st.attuned_to_id if st and st.attuned_to_id is not None else "",
+                             st.appearance if st else "", *kps])
 
             frame_idx += 1
             if frame_idx % 50 == 0:
@@ -1295,17 +1596,16 @@ def main() -> int:
     finally:
         cap.release()
         writer.release()
+        if skel_writer is not None:
+            skel_writer.release()
         tracks_csv.close()
         hands.close_all(frame_idx / fps, frame_idx)
-        if idm.merged:  # rewrite temporary IDs that were later merged into their final stable ID
-            merged = {str(k): str(idm.resolve(k)) for k in idm.merged}
-            path = out_dir / f"{video.stem}_tracks.csv"
-            with open(path, newline="") as fh:
-                rows = list(csv.reader(fh))
-            for r in rows[1:]:
-                r[2] = merged.get(r[2], r[2])
-            with open(path, "w", newline="") as fh:
-                csv.writer(fh).writerows(rows)
+        rows = postprocess_tracks(tracks_path, idm)  # applies late merges, recomputes distance per final ID
+        memory = labeler.memory if labeler else {}
+        id_summary_path = out_dir / f"{video.stem}_id_summary.csv"
+        write_id_summary(rows, idm, hands, fps, memory, id_summary_path)
+        map_paths = write_trajectory_maps(rows, idm, calib, first, out_dir, video.stem) if rows else []
+        if idm.merged:  # keyframes: temporary IDs that were later merged into their final stable ID
             for kf in keyframes:
                 for person in kf["people"]:
                     person["id"] = idm.resolve(person["id"])
@@ -1336,6 +1636,8 @@ def main() -> int:
             keyframes=keyframes, events=events, remaps=idm.remaps, possible_swaps=possible_swaps,
             identities={str(sid): dict(first_t=round(d.first_t, 3), last_t=round(d.last_t, 3),
                                        frames_seen=d.frames_seen, raw_ids=d.raw_ids,
+                                       home_seat_xy=[round(float(v), 3) for v in d.home_seat]
+                                       if d.home_seat is not None else None,
                                        appearance=labeler.memory.get(sid) if labeler else None)
                         for sid, d in sorted(idm.ids.items())},
             merged_ids={str(k): idm.resolve(k) for k in idm.merged},  # already applied to tracks CSV/keyframes
@@ -1356,7 +1658,9 @@ def main() -> int:
         log(f"  Gemini id_mismatch flags   : {summary['gemini_id_mismatch_flags']}")
         log(f"  failed Gemini calls        : {summary['gemini_failed']} / {summary['gemini_calls']} attempted"
             f"  [{vlm_status}]")
-        log(f"  outputs: {out_video}, {events_path}")
+        log(f"  outputs: {out_video}, {events_path}, {tracks_path.name}, {id_summary_path.name}"
+            + (f", {skel_video.name}" if skel_writer is not None else "")
+            + "".join(f", {p.name}" for p in map_paths))
         log("=" * 64)
     return 0
 
