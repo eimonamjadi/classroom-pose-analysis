@@ -1,0 +1,12 @@
+ultralytics>=8.3.0      # YOLO11 pose + BoT-SORT/ReID (tested 8.4.216)
+opencv-python>=4.8.0    # GUI build: needed for the interactive floor-calibration window
+numpy>=1.24.0
+scipy>=1.10.0
+torch>=2.0.0
+supervision>=0.26.0     # Detections container (tested 0.32.0)
+trackers>=2.7.0         # ByteTrack (moved out of supervision in 0.31); tested 2.7.0
+lap>=0.5.12             # linear assignment used by Ultralytics trackers (botsort_reid mode)
+transformers>=4.48.0    # SigLIP appearance embeddings (tested 5.24.0)
+google-genai>=1.51.0    # Gemini; ThinkingConfig(thinking_level=...) needs >=1.51 (tested 3.6.1)
+pydantic>=2.0           # Gemini structured-output schema
+PyYAML>=6.0             # BoT-SORT tracker config
