@@ -53,7 +53,7 @@ from scipy.optimize import linear_sum_assignment
 # --- detection / pose ---
 POSE_MODEL = "yolo11m-pose.pt"     # Ultralytics pose weights (auto-downloaded on first run)
 DET_CONF = 0.1                     # pose conf; low so the tracker's 2nd (low-score) stage receives weak boxes
-DET_IMGSZ = 1280                   # inference size; >640 helps small back-row students (slower)
+DET_IMGSZ = 1280                   # max inference size (>640 helps small back-row students); smaller videos run native
 KP_CONF = 0.35                     # min keypoint confidence for a keypoint to count as visible
 
 # --- tracking ---
@@ -966,6 +966,7 @@ def main() -> int:
 
     from ultralytics import YOLO
     model = YOLO(POSE_MODEL)
+    imgsz = min(DET_IMGSZ, int(math.ceil(max(W, H) / 32) * 32))  # never upscale beyond native resolution
     if TRACKER == "bytetrack":
         tracker = ByteTrackAdapter(fps)
         tracker_desc = f"bytetrack ({tracker.kind})"
@@ -974,7 +975,7 @@ def main() -> int:
         tracker_desc = f"botsort_reid (ultralytics, {botsort_yaml})"
     else:
         raise ValueError(f"unknown TRACKER {TRACKER!r}")
-    log(f"[tracker] {tracker_desc}")
+    log(f"[tracker] {tracker_desc}; pose imgsz={imgsz}")
 
     embedder = AppearanceEmbedder(SIGLIP_MODEL)
     log(f"[identity] SigLIP {SIGLIP_MODEL} on {embedder.device}")
@@ -1021,7 +1022,7 @@ def main() -> int:
 
             # ---------------- detection + tracking (keypoints aligned 1:1 with tracks) ----------------
             if TRACKER == "bytetrack":
-                res = model(frame, conf=DET_CONF, imgsz=DET_IMGSZ, verbose=False)[0]
+                res = model(frame, conf=DET_CONF, imgsz=imgsz, verbose=False)[0]
                 dets = sv.Detections.from_ultralytics(res)
                 kxy_all, kconf_all = keypoints_of(res)
                 dets.data["kp_idx"] = np.arange(len(dets))
@@ -1029,7 +1030,7 @@ def main() -> int:
                 kp_idx = np.asarray(dets.data.get("kp_idx", np.zeros(0, int)), dtype=int)  # empty -> no data
                 kp_xy, kp_conf = kxy_all[kp_idx], kconf_all[kp_idx]
             else:
-                res = model.track(frame, persist=True, tracker=str(botsort_yaml), conf=DET_CONF, imgsz=DET_IMGSZ,
+                res = model.track(frame, persist=True, tracker=str(botsort_yaml), conf=DET_CONF, imgsz=imgsz,
                                   verbose=False)[0]
                 dets = sv.Detections.from_ultralytics(res)  # IDs + keypoints from the same results object
                 kp_xy, kp_conf = keypoints_of(res)
