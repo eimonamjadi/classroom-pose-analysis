@@ -74,6 +74,9 @@ MAX_DIST = 1.5                     # max floor distance (m) to the lost ID's las
 REMAP_WINDOW_SEC = 30.0            # lost IDs last seen within this window can be reclaimed (raise -> fewer new IDs)
 OCCLUDED_FRAC = 0.3                # don't update a gallery from a crop whose box is >30% covered by another detection
 EDGE_MARGIN_FRAC = 0.01            # boxes this close to the frame edge are truncated: no gallery update/drift check
+PENDING_SEC = 3.0                  # new ID whose first crop was occluded/cut off stays provisional this long and is
+                                   #   re-tested (same MIN_SIM/MAX_DIST rule) on clean crops; merged if it passes
+PENDING_RETEST_SEC = 0.25          # how often a provisional ID is re-embedded and re-tested
 DRIFT_SIM = 0.80                   # refresh below this sim to its own gallery = "appearance drift": logged, not merged
 MIN_CROP_PX = 16                   # don't embed crops smaller than this (either side)
 
@@ -479,6 +482,7 @@ class Identity:
     raw_ids: list = field(default_factory=list)
     frames_seen: int = 0
     drifting: bool = False
+    provisional_until: float = -1.0          # > t while the ID is provisional (first crop was not clean)
 
 
 class IdentityManager:
@@ -487,7 +491,9 @@ class IdentityManager:
     A new raw ID may reclaim a stable ID that is NOT active in this frame, was last seen within REMAP_WINDOW_SEC,
     has cosine similarity >= MIN_SIM between the new crop's embedding and its gallery, and whose last floor
     position is within MAX_DIST. Multiple new raw IDs in one frame are matched jointly (Hungarian, max similarity).
-    Otherwise a new stable ID is created. One SigLIP forward pass per frame embeds all needed crops."""
+    Otherwise a new stable ID is created. If that new ID's first crop was occluded or cut off (unreliable evidence),
+    it is provisional for PENDING_SEC: it is re-tested with the same rule on clean crops and merged into the lost ID
+    if it passes. One SigLIP forward pass per frame embeds all needed crops."""
 
     def __init__(self, embedder: AppearanceEmbedder):
         self.embedder = embedder
@@ -497,6 +503,7 @@ class IdentityManager:
         self.all_raw_ids: set[int] = set()
         self.remaps: list[dict] = []
         self.events: list[dict] = []           # identity_new / identity_remap / appearance_drift
+        self.merged: dict[int, int] = {}       # provisional stable ID -> stable ID it was merged into
 
     def _gallery_update(self, ident: Identity, emb: np.ndarray) -> None:
         if ident.gallery is None:
@@ -506,6 +513,20 @@ class IdentityManager:
         g = (1 - a) * ident.gallery + a * emb
         ident.gallery = g / (np.linalg.norm(g) + 1e-12)
         ident.n_gallery += 1
+
+    def _lost_candidates(self, active: set[int], t: float) -> list[Identity]:
+        return [d for d in self.ids.values() if d.sid not in active and d.gallery is not None
+                and d.floor is not None and t - d.last_t <= REMAP_WINDOW_SEC]
+
+    def _log_remap(self, frame_idx: int, t: float, raw: int, ident: Identity, sim: float, dist: float, **extra):
+        gap = t - ident.last_t
+        ev = dict(type="identity_remap", frame=frame_idx, t=round(t, 3), raw_id=raw, stable_id=ident.sid,
+                  similarity=round(sim, 4), distance_m=round(dist, 3), gap_sec=round(gap, 3), **extra)
+        self.remaps.append(ev)
+        self.events.append(ev)
+        how = f" (deferred: provisional #{extra['provisional_id']} merged)" if extra else ""
+        log(f"[remap] frame {frame_idx} t={t:.2f}s raw {raw} -> stable {ident.sid} "
+            f"(sim {sim:.3f}, dist {dist:.2f} m, gap {gap:.1f}s){how}")
 
     def update(self, frame_idx: int, t: float, frame: np.ndarray, raw_ids: np.ndarray, xyxy: np.ndarray,
                kp_xy: np.ndarray, kp_conf: np.ndarray, floor_raw: np.ndarray,
@@ -526,10 +547,13 @@ class IdentityManager:
         # crops that must not update a gallery: covered by another detection, or cut off by the frame edge
         bad = (occlusion_fraction(xyxy, occluders) > OCCLUDED_FRAC) | truncated(xyxy, frame.shape[1], frame.shape[0])
 
-        # ---- one batched SigLIP pass: new tracks immediately + ~1 Hz gallery refresh for active IDs ----
-        refresh_idx = [i for i in range(n) if sids[i] >= 0 and not bad[i]
+        # ---- one batched SigLIP pass: new tracks immediately, provisional IDs (clean crop) every
+        #      PENDING_RETEST_SEC, ~1 Hz gallery refresh for the other active IDs ----
+        pending_idx = [i for i in range(n) if sids[i] >= 0 and not bad[i] and self.ids[sids[i]].provisional_until > t
+                       and t - self.ids[sids[i]].last_embed_t >= PENDING_RETEST_SEC]
+        refresh_idx = [i for i in range(n) if sids[i] >= 0 and not bad[i] and self.ids[sids[i]].provisional_until <= t
                        and t - self.ids[sids[i]].last_embed_t >= EMBED_REFRESH_SEC]
-        want = new_idx + refresh_idx
+        want = new_idx + pending_idx + refresh_idx
         crops, owners = [], []
         for i in want:
             c = appearance_crop(frame, xyxy[i], kp_xy[i], kp_conf[i])
@@ -554,7 +578,7 @@ class IdentityManager:
                                   raw_id=int(raw_ids[i]), similarity=round(sim, 4))
                         self.events.append(ev)
                         log(f"[drift] frame {frame_idx} t={t:.2f}s stable {ident.sid} (raw {int(raw_ids[i])}) "
-                            f"crop sim {sim:.3f} < {DRIFT_SIM}: possible swap, gallery frozen")
+                            f"crop sim {sim:.3f} < {DRIFT_SIM}: possible swap or contaminated crop, gallery frozen")
                     ident.drifting = True
                     continue
             ident.drifting = False
@@ -562,8 +586,7 @@ class IdentityManager:
 
         # ---- new raw IDs: reclaim a lost stable ID or create a new one ----
         if new_idx:
-            cands = [d for d in self.ids.values() if d.sid not in active and d.gallery is not None
-                     and d.floor is not None and t - d.last_t <= REMAP_WINDOW_SEC]
+            cands = self._lost_candidates(active, t)
             S = np.full((len(new_idx), len(cands)), -1.0)
             D = np.full((len(new_idx), len(cands)), np.inf)
             for a, i in enumerate(new_idx):
@@ -584,14 +607,7 @@ class IdentityManager:
                     ident = cands[matched[a]]
                     for rr in [rr for rr, s in self.raw_to_sid.items() if s == ident.sid]:
                         del self.raw_to_sid[rr]  # retire the old raw ID; if it comes back it is re-matched
-                    gap = t - ident.last_t
-                    ev = dict(type="identity_remap", frame=frame_idx, t=round(t, 3), raw_id=raw, stable_id=ident.sid,
-                              similarity=round(float(S[a, matched[a]]), 4),
-                              distance_m=round(float(D[a, matched[a]]), 3), gap_sec=round(gap, 3))
-                    self.remaps.append(ev)
-                    self.events.append(ev)
-                    log(f"[remap] frame {frame_idx} t={t:.2f}s raw {raw} -> stable {ident.sid} "
-                        f"(sim {ev['similarity']:.3f}, dist {ev['distance_m']:.2f} m, gap {gap:.1f}s)")
+                    self._log_remap(frame_idx, t, raw, ident, float(S[a, matched[a]]), float(D[a, matched[a]]))
                     if e is not None and not bad[i]:
                         self._gallery_update(ident, e)
                     ident.drifting = False
@@ -599,9 +615,13 @@ class IdentityManager:
                     ident = Identity(sid=self.next_sid, first_t=t, last_t=t, last_frame=frame_idx)
                     self.next_sid += 1
                     self.ids[ident.sid] = ident
-                    if e is not None:
+                    clean = e is not None and not bad[i]
+                    if clean:
                         self._gallery_update(ident, e)
-                    ev = dict(type="identity_new", frame=frame_idx, t=round(t, 3), raw_id=raw, stable_id=ident.sid)
+                    else:  # unreliable first crop: decide again on clean crops before committing
+                        ident.provisional_until = t + PENDING_SEC
+                    ev = dict(type="identity_new", frame=frame_idx, t=round(t, 3), raw_id=raw, stable_id=ident.sid,
+                              provisional=not clean)
                     if len(cands):  # best rejected candidate, for tuning MIN_SIM / MAX_DIST
                         b = int(np.argmax(np.where(D[a] <= MAX_DIST, S[a], S[a] - 10)))
                         ev.update(best_candidate=cands[b].sid, best_sim=round(float(S[a, b]), 4),
@@ -612,6 +632,39 @@ class IdentityManager:
                 self.raw_to_sid[raw] = ident.sid
                 sids[i] = ident.sid
                 active.add(ident.sid)
+
+        # ---- deferred re-check of provisional IDs on clean crops (same MIN_SIM / MAX_DIST rule) ----
+        for i in pending_idx:
+            prov = self.ids[sids[i]]
+            prov.last_embed_t = t
+            e = emb_of.get(i)
+            if e is None:
+                continue
+            best = None
+            for d in self._lost_candidates(active, t):
+                sim, dist = float(d.gallery @ e), float(np.linalg.norm(floor_raw[i] - d.floor))
+                if sim >= MIN_SIM and dist <= MAX_DIST and (best is None or sim > best[1]):
+                    best = (d, sim, dist)
+            if best is None:
+                self._gallery_update(prov, e)  # clean evidence for the provisional ID itself
+                continue
+            ident, sim, dist = best
+            raw = int(raw_ids[i])
+            for rr in [rr for rr, s in self.raw_to_sid.items() if s in (ident.sid, prov.sid)]:
+                del self.raw_to_sid[rr]
+            self._log_remap(frame_idx, t, raw, ident, sim, dist, deferred=True, provisional_id=prov.sid,
+                            provisional_sec=round(t - prov.first_t, 3))
+            self.merged[prov.sid] = ident.sid
+            del self.ids[prov.sid]
+            self.raw_to_sid[raw] = ident.sid
+            ident.raw_ids.append(raw)
+            ident.frames_seen += prov.frames_seen
+            ident.drifting = False
+            ident.last_embed_t = t
+            self._gallery_update(ident, e)
+            active.discard(prov.sid)
+            active.add(ident.sid)
+            sids[i] = ident.sid
 
         for i in range(n):
             ident = self.ids[sids[i]]
@@ -1121,11 +1174,24 @@ def main() -> int:
         writer.release()
         tracks_csv.close()
         hands.close_all(frame_idx / fps, frame_idx)
+        if idm.merged:  # rewrite provisional IDs that were later merged into their final stable ID
+            merged = {str(k): str(v) for k, v in idm.merged.items()}
+            path = out_dir / f"{video.stem}_tracks.csv"
+            with open(path, newline="") as fh:
+                rows = list(csv.reader(fh))
+            for r in rows[1:]:
+                r[2] = merged.get(r[2], r[2])
+            with open(path, "w", newline="") as fh:
+                csv.writer(fh).writerows(rows)
+            for kf in keyframes:
+                for person in kf["people"]:
+                    person["id"] = idm.merged.get(person["id"], person["id"])
 
         events = sorted(idm.events + hands.events + possible_swaps + vlm_events, key=lambda e: (e["frame"], e["type"]))
         summary = dict(
             frames_processed=frame_idx, seconds_processed=round(frame_idx / fps, 3),
             raw_tracker_ids=len(idm.all_raw_ids), stable_ids=len(idm.ids), remaps=len(idm.remaps),
+            deferred_remaps=len(idm.merged),
             appearance_drift_events=sum(e["type"] == "appearance_drift" for e in idm.events),
             hand_raise_events=sum(e["type"] == "hand_raise_start" for e in hands.events),
             gemini_status=vlm_status,
@@ -1144,6 +1210,7 @@ def main() -> int:
                                        frames_seen=d.frames_seen, raw_ids=d.raw_ids,
                                        appearance=labeler.memory.get(sid) if labeler else None)
                         for sid, d in sorted(idm.ids.items())},
+            merged_provisional_ids={str(k): v for k, v in idm.merged.items()},  # already applied to tracks CSV
             summary=summary,
         )
         events_path = out_dir / f"{video.stem}_events.json"
@@ -1154,7 +1221,8 @@ def main() -> int:
         log(f"SUMMARY  ({summary['seconds_processed']:.1f}s, {frame_idx} frames, {tracker_desc})")
         log(f"  total raw tracker IDs      : {summary['raw_tracker_ids']}")
         log(f"  total stable IDs           : {summary['stable_ids']}")
-        log(f"  identity remaps            : {summary['remaps']}")
+        log(f"  identity remaps            : {summary['remaps']}"
+            + (f"  ({summary['deferred_remaps']} deferred: provisional ID merged)" if idm.merged else ""))
         log(f"  Gemini id_mismatch flags   : {summary['gemini_id_mismatch_flags']}")
         log(f"  failed Gemini calls        : {summary['gemini_failed']} / {summary['gemini_calls']} attempted"
             f"  [{vlm_status}]")

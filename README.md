@@ -101,6 +101,13 @@ homography is written instead and a warning is printed. Edit it, because `MAX_DI
 
   Otherwise it gets a new stable ID. Several new raw IDs in one frame are matched jointly (Hungarian).
   Every remap is logged with frame, raw ID, stable ID, similarity, distance and gap.
+- **Provisional IDs.** A person often comes back half-hidden behind whoever was in front of them, and that first
+  crop is too contaminated to match. When the crop is occluded or cut off by the frame edge, the new ID is
+  **provisional** for `PENDING_SEC`:
+  - It is re-tested every `PENDING_RETEST_SEC` on clean crops, using the same `MIN_SIM` + `MAX_DIST` rule.
+  - If it passes, it is merged into the lost ID. That counts as a remap with `deferred: true`.
+  - Merged provisional IDs are rewritten in the tracks CSV and keyframes, and listed under
+    `merged_provisional_ids`. The annotated video may show the provisional number for up to `PENDING_SEC`.
 - **Gemini** keeps a short appearance note per stable ID and sees the stored notes in each prompt.
   - When it reports `id_mismatch`, the event is logged as a possible swap and the stored note is **not**
     overwritten.
@@ -123,6 +130,7 @@ All tunables are constants at the top of `run_classroom.py`. Start from the even
 | `best_sim` just below `MIN_SIM` | lower `MIN_SIM` in steps of 0.02 (not much below ~0.86 for SigLIP-base; different people commonly score 0.75-0.88) |
 | `best_dist_m` just above `MAX_DIST` | fix the floor calibration first, then raise `MAX_DIST` (1.5 -> 2.0 m) |
 | gap longer than `REMAP_WINDOW_SEC` | raise `REMAP_WINDOW_SEC` (seated students are safe to keep for 60 s+) |
+| person came back partly hidden, crop is a mix of two people | raise `PENDING_SEC` (3 -> 5 s) so the provisional ID gets more time to show a clean crop |
 | no `best_*` fields (no candidate) | the lost ID was still "active" or had no gallery: raise `LOST_TRACK_BUFFER_SEC` (2 -> 3-4 s) so the tracker bridges the gap itself |
 
 Also worth trying:
@@ -138,6 +146,7 @@ Signs: Gemini `possible_swap` events, `appearance_drift` events, or a remap with
 - Lower `MAX_DIST` (1.0 m works when students stay seated).
 - Lower `REMAP_WINDOW_SEC`.
 - Raise `DRIFT_SIM` (freeze galleries sooner) and/or lower `GALLERY_EMA` (galleries adapt more slowly).
+- Lower `PENDING_SEC` (or set it to 0 to disable deferred re-checks) if provisional IDs merge into the wrong person.
 - Lower `OCCLUDED_FRAC` so crops overlapping a neighbor never update a gallery.
 - For swaps between two tracks that never break (no new raw ID, so no remap can fix them):
   - raise `TRACK_ACTIVATION_THRESHOLD` and `TRACK_MIN_IOU`
