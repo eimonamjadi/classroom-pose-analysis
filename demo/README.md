@@ -11,7 +11,15 @@
 
 The floor calibration for this clip was estimated by eye, so radar depth is compressed toward the camera side.
 
-**Attribution:** source footage is `classroom.mp4` from
+- `demo_overlap_aisle_50s.mp4` and `filmstrips_overlap_aisle.jpg`: overlap test on a shop aisle (6 people, constant
+  crossings). 7 raw tracker IDs -> 6 stable IDs, no swaps. At ~10 s the hat man (#2) crouches behind another
+  shopper, briefly shows provisional #4, and is merged back into #2 at 13.3 s.
+- `demo_identical_vests_36s.mp4` and `filmstrips_identical_vests.jpg`: two workers in identical vests and hard
+  hats walking side by side keep separate IDs; newcomers in the same outfit are not merged into earlier workers.
+
+All demos were produced with the current code (default ByteTrack + stable-ID layer).
+
+**Attribution:** source footage is `classroom.mp4`, `store-aisle-detection.mp4` and `worker-zone-detection.mp4` from
 [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos), licensed
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Changes: trimmed to 30 s, annotated with tracking
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Changes: trimmed (and for the aisle/worker clips resampled to 30 fps and resized), annotated with tracking
 overlays and a radar panel, downscaled and re-encoded.

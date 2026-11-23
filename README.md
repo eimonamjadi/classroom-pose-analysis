@@ -163,6 +163,46 @@ Thresholds depend on the room, the clothing and the camera. To recalibrate:
 4. Put `MIN_SIM` just above the high tail of the different-person scores, and `DRIFT_SIM` just below the low
    tail of the same-person scores.
 
-## Verification run
+## Verification
 
-Results from the first 30 s of a public test clip are added below once the run completes.
+All runs used CPU only. Gemini was disabled in the test sandbox (no API key, no network route to the API), so the
+Gemini numbers below are 0 / 0. The Gemini code path was tested separately with a mocked client:
+- retries on 429/500/503 with backoff;
+- immediate raise on other errors;
+- returned IDs that are not active stable IDs are ignored;
+- an `id_mismatch` flag is logged and the stored appearance note is kept.
+
+The test clips come from [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos)
+(CC BY 4.0). None of them has ground-truth IDs, so swaps and wrong merges were checked visually with
+`tools/id_filmstrips.py` (one row of crops per stable ID) and `tools/identity_audit.py` (each remap and each new
+ID next to its best candidate).
+
+| clip | what it tests | people | raw tracker IDs | stable IDs | remaps | swaps | wrong merges |
+|---|---|---|---|---|---|---|---|
+| `classroom.mp4`, first 30 s (`--max-seconds 30`) | the reference run | 4 | 4 | 4 | 0 | 0 | 0 |
+| same, 3 seated people hidden for 3.5 s each (longer than the tracker buffer) | forced re-acquisition | 4 | 7 | 4 | 3 | 0 | 0 |
+| `store-aisle-detection.mp4` 14-64 s, ByteTrack | real overlaps and crossings | 6 | 7 | 6 | 1 (deferred) | 0 | 0 |
+| same, `--tracker botsort_reid` | same | 6 | 7 | 6 | 1 (deferred) | 0 | 0 |
+| `worker-zone-detection.mp4` 14-50 s | two people in identical vests and hard hats side by side; re-entries | 4 appearances | 4 | 4 | 0 | 0 | 0 |
+
+Reference run summary (classroom, first 30 s): raw tracker IDs 4, stable IDs 4, remaps 0, Gemini `id_mismatch`
+flags 0, failed Gemini calls 0 / 0 (disabled).
+
+Notes:
+- **Aisle.** A person crouched behind someone, the tracker dropped him, and he came back half-hidden. The right
+  lost ID was 0.15-0.5 m away, but his contaminated first crop scored only 0.76 similarity. Before provisional IDs
+  existed, that produced a duplicate ID with both trackers. Now the provisional ID is re-tested on a clean crop and
+  merged 1.5 s later (similarity 0.91-0.92). BoT-SORT's own ReID did not bridge this gap either; the
+  stable-ID layer did.
+- **Workers.** The identical-vest pair never physically crossed, so this shows no swaps and no wrong merges with
+  identical clothing, not a true crossing. Their SigLIP similarity to the earlier vest-wearing worker was 0.41-0.72,
+  well below `MIN_SIM`, and the floor-distance gate (5.9-11 m) also rejected them.
+- **Thresholds.** `MIN_SIM = 0.90` and `DRIFT_SIM = 0.80` come from gallery-vs-crop similarities on the classroom
+  clip:
+  - same person: 1st percentile 0.82, median 0.98;
+  - different people: median 0.79, max 0.899.
+- **Raised hands.** The pose rule found the one real raised hand in the classroom clip (17.4-19.8 s, after the
+  0.5 s hold). In the aisle clip it also fired on someone reaching up to a shelf. The pose rule cannot tell those
+  apart; Gemini's behavior labels can.
+- **Floor calibration.** The calibrations for these clips were estimated by eye, so radar distances are
+  approximate.
