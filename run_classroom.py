@@ -72,7 +72,8 @@ GALLERY_EMA = 0.2                  # weight of a fresh embedding in the gallery 
 MIN_SIM = 0.90                     # min cosine sim (crop vs gallery) to reclaim a lost ID  (raise -> fewer wrong merges)
 MAX_DIST = 1.5                     # max floor distance (m) to the lost ID's last position  (lower -> fewer wrong merges)
 REMAP_WINDOW_SEC = 30.0            # lost IDs last seen within this window can be reclaimed (raise -> fewer new IDs)
-OCCLUDED_FRAC = 0.3                # don't update a gallery from a crop whose box is >30% covered by another box
+OCCLUDED_FRAC = 0.3                # don't update a gallery from a crop whose box is >30% covered by another detection
+EDGE_MARGIN_FRAC = 0.01            # boxes this close to the frame edge are truncated: no gallery update/drift check
 DRIFT_SIM = 0.80                   # refresh below this sim to its own gallery = "appearance drift": logged, not merged
 MIN_CROP_PX = 16                   # don't embed crops smaller than this (either side)
 
@@ -436,20 +437,30 @@ def appearance_crop(frame: np.ndarray, box, kp_xy: np.ndarray, kp_conf: np.ndarr
     return frame[y1:y2, x1:x2]
 
 
-def occlusion_fraction(xyxy: np.ndarray) -> np.ndarray:
-    """For each box: max fraction of its area covered by any other box."""
-    n = len(xyxy)
-    if n < 2:
-        return np.zeros(n)
-    x1 = np.maximum(xyxy[:, None, 0], xyxy[None, :, 0])
-    y1 = np.maximum(xyxy[:, None, 1], xyxy[None, :, 1])
-    x2 = np.minimum(xyxy[:, None, 2], xyxy[None, :, 2])
-    y2 = np.minimum(xyxy[:, None, 3], xyxy[None, :, 3])
+def occlusion_fraction(xyxy: np.ndarray, others: Optional[np.ndarray] = None) -> np.ndarray:
+    """For each box: max fraction of its area covered by any other box. `others` (e.g. all confident detections,
+    tracked or not) defaults to xyxy itself; a box in `others` that is (nearly) identical to the query is itself."""
+    others = xyxy if others is None else others
+    if len(xyxy) == 0 or len(others) == 0:
+        return np.zeros(len(xyxy))
+    x1 = np.maximum(xyxy[:, None, 0], others[None, :, 0])
+    y1 = np.maximum(xyxy[:, None, 1], others[None, :, 1])
+    x2 = np.minimum(xyxy[:, None, 2], others[None, :, 2])
+    y2 = np.minimum(xyxy[:, None, 3], others[None, :, 3])
     inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
     area = np.clip((xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1]), 1e-6, None)
-    frac = inter / area[:, None]
-    np.fill_diagonal(frac, 0)
+    area_o = np.clip((others[:, 2] - others[:, 0]) * (others[:, 3] - others[:, 1]), 1e-6, None)
+    iou = inter / (area[:, None] + area_o[None, :] - inter)
+    frac = np.where(iou > 0.95, 0.0, inter / area[:, None])  # ignore self
     return frac.max(axis=1)
+
+
+def truncated(xyxy: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Boxes touching the frame edge (person partly outside the frame)."""
+    m = EDGE_MARGIN_FRAC * min(w, h)
+    if len(xyxy) == 0:
+        return np.zeros(0, dtype=bool)
+    return (xyxy[:, 0] <= m) | (xyxy[:, 1] <= m) | (xyxy[:, 2] >= w - m) | (xyxy[:, 3] >= h - m)
 
 
 # =====================================================================================================
@@ -497,7 +508,9 @@ class IdentityManager:
         ident.n_gallery += 1
 
     def update(self, frame_idx: int, t: float, frame: np.ndarray, raw_ids: np.ndarray, xyxy: np.ndarray,
-               kp_xy: np.ndarray, kp_conf: np.ndarray, floor_raw: np.ndarray) -> np.ndarray:
+               kp_xy: np.ndarray, kp_conf: np.ndarray, floor_raw: np.ndarray,
+               occluders: Optional[np.ndarray] = None) -> np.ndarray:
+        """occluders: all confident detection boxes this frame (tracked or not), for the occlusion check."""
         n = len(raw_ids)
         sids = np.full(n, -1, dtype=int)
         new_idx: list[int] = []
@@ -510,10 +523,11 @@ class IdentityManager:
             else:
                 sids[i] = sid
         active = set(int(s) for s in sids if s >= 0)
-        occl = occlusion_fraction(xyxy) if n else np.zeros(0)
+        # crops that must not update a gallery: covered by another detection, or cut off by the frame edge
+        bad = (occlusion_fraction(xyxy, occluders) > OCCLUDED_FRAC) | truncated(xyxy, frame.shape[1], frame.shape[0])
 
         # ---- one batched SigLIP pass: new tracks immediately + ~1 Hz gallery refresh for active IDs ----
-        refresh_idx = [i for i in range(n) if sids[i] >= 0 and occl[i] <= OCCLUDED_FRAC
+        refresh_idx = [i for i in range(n) if sids[i] >= 0 and not bad[i]
                        and t - self.ids[sids[i]].last_embed_t >= EMBED_REFRESH_SEC]
         want = new_idx + refresh_idx
         crops, owners = [], []
@@ -578,7 +592,7 @@ class IdentityManager:
                     self.events.append(ev)
                     log(f"[remap] frame {frame_idx} t={t:.2f}s raw {raw} -> stable {ident.sid} "
                         f"(sim {ev['similarity']:.3f}, dist {ev['distance_m']:.2f} m, gap {gap:.1f}s)")
-                    if e is not None and occl[i] <= OCCLUDED_FRAC:
+                    if e is not None and not bad[i]:
                         self._gallery_update(ident, e)
                     ident.drifting = False
                 else:
@@ -1024,6 +1038,7 @@ def main() -> int:
             if TRACKER == "bytetrack":
                 res = model(frame, conf=DET_CONF, imgsz=imgsz, verbose=False)[0]
                 dets = sv.Detections.from_ultralytics(res)
+                occluders = dets.xyxy[dets.confidence >= TRACK_HIGH_THRESH] if len(dets) else None
                 kxy_all, kconf_all = keypoints_of(res)
                 dets.data["kp_idx"] = np.arange(len(dets))
                 dets = tracker.update(dets)
@@ -1034,6 +1049,7 @@ def main() -> int:
                                   verbose=False)[0]
                 dets = sv.Detections.from_ultralytics(res)  # IDs + keypoints from the same results object
                 kp_xy, kp_conf = keypoints_of(res)
+                occluders = None  # Ultralytics returns tracked boxes only; occlusion is checked among those
                 if dets.tracker_id is None:
                     keep = np.zeros(len(dets), dtype=bool)
                     dets.tracker_id = np.full(len(dets), -1, dtype=int)
@@ -1046,7 +1062,7 @@ def main() -> int:
             # ---------------- floor + stable identities ----------------
             anchors, modes = estimate_ground_anchors(xyxy, kp_xy, kp_conf)
             floor_raw = to_floor(Hm, anchors)
-            sids = idm.update(frame_idx, t, frame, raw_ids, xyxy, kp_xy, kp_conf, floor_raw)
+            sids = idm.update(frame_idx, t, frame, raw_ids, xyxy, kp_xy, kp_conf, floor_raw, occluders)
             positions: dict[int, np.ndarray] = {}
             for i, sid in enumerate(sids):
                 positions[int(sid)] = smoother.update(int(sid), floor_raw[i])

@@ -3,6 +3,11 @@
 - `demo_tracking_30s.mp4`: `run_classroom.py` output (default ByteTrack + stable-ID layer, Gemini disabled) on the
   first 30 s of the test clip. Video frame on top, floor radar underneath. Watch #1 raise a hand at ~17-20 s.
 - `gemini_tagged_frame.jpg`: the ID-tagged frame format sent to Gemini (tags only, just above each head).
+- `demo_occlusion_stress_30s.mp4`: the same 30 s with three seated people hidden behind grey panels for 3.5 s each,
+  longer than the tracker's 2 s buffer, so ByteTrack issues new raw IDs. The stable-ID layer reclaims all three:
+  7 raw tracker IDs -> 4 stable IDs, 3 remaps (similarity 0.97-0.98, floor distance 0.01 m).
+- `audit_occlusion_stress.jpg`: `tools/identity_audit.py` sheet for that run. For each remap, the left crop is the
+  stable ID when last seen and the right crop is the track that reclaimed it (all three correct).
 
 The floor calibration for this clip was estimated by eye, so radar depth is compressed toward the camera side.
 
