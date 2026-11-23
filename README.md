@@ -162,7 +162,9 @@ The script uses CUDA automatically when available, for both YOLO and SigLIP.
   `SEAT_RADIUS`). The place held longest is its **home seat**.
   - `seat` rule: a newcomer who settles within `SEAT_MATCH_DIST` of a missing ID's home seat, within
     `SEAT_CLAIM_WINDOW_SEC` of appearing, is merged into that ID if their clothing galleries match with similarity
-    `>= LONG_MIN_SIM`.
+    `>= SEAT_MIN_SIM` (0.95). This bar is higher than `LONG_MIN_SIM` because it compares two averaged galleries,
+    which score higher than a single crop for everyone. The closest seat-rule comparison each ID saw is logged as
+    `closest_seat_rule_candidate` in the events JSON.
   - This covers a student who leaves through one door, comes back minutes later through another, and sits down
     in their usual seat.
 - **Provisional IDs.** A person often comes back half-hidden behind whoever was in front of them, and that first
@@ -196,7 +198,7 @@ All tunables are constants at the top of `run_classroom.py`. Start from the even
 | `best_dist_m` just above `MAX_DIST` | fix the floor calibration first, then raise `MAX_DIST` (1.5 -> 2.0 m) |
 | gap longer than `REMAP_WINDOW_SEC` | raise `REMAP_WINDOW_SEC` (seated students are safe to keep for 60 s+) |
 | person came back partly hidden, crop is a mix of two people | raise `PENDING_SEC` (3 -> 5 s) so the provisional ID gets more time to show a clean crop |
-| person left the room and came back much later as a new ID | check `best_missing_sec` / `best_sim`: raise `LONG_ABSENCE_SEC`, or lower `LONG_MIN_SIM` a little (not below `MIN_SIM`); for seated classes check that `home seat` positions are stable (calibration) and raise `SEAT_MATCH_DIST` slightly |
+| person left the room and came back much later as a new ID | check `best_missing_sec` / `best_sim` and `closest_seat_rule_candidate`: raise `LONG_ABSENCE_SEC`, or lower `LONG_MIN_SIM` / `SEAT_MIN_SIM` a little (not below `MIN_SIM`); for seated classes check that home-seat positions are stable (calibration) and raise `SEAT_MATCH_DIST` slightly |
 | no `best_*` fields (no candidate) | the lost ID was still "active" or had no gallery: raise `LOST_TRACK_BUFFER_SEC` (2 -> 3-4 s) so the tracker bridges the gap itself |
 
 Also worth trying:
@@ -214,7 +216,7 @@ Signs: Gemini `possible_swap` events, `appearance_drift` events, or a remap with
 - Raise `DRIFT_SIM` (freeze galleries sooner) and/or lower `GALLERY_EMA` (galleries adapt more slowly).
 - Lower `PENDING_SEC` (or set it to 0 to disable deferred re-checks) if provisional IDs merge into the wrong person.
 - If people who left are later merged with someone else (`rule: long` or `rule: seat` remaps that look wrong in
-  `tools/identity_audit.py`): raise `LONG_MIN_SIM`, lower `SEAT_MATCH_DIST`, or shorten `LONG_ABSENCE_SEC` /
+  `tools/identity_audit.py`): raise `LONG_MIN_SIM` / `SEAT_MIN_SIM`, lower `SEAT_MATCH_DIST`, or shorten `LONG_ABSENCE_SEC` /
   `SEAT_CLAIM_WINDOW_SEC`. Setting `LONG_ABSENCE_SEC = 0` and `SEAT_CLAIM_WINDOW_SEC = 0` turns the
   re-entry rules off.
 - Lower `OCCLUDED_FRAC` so crops overlapping a neighbor never update a gallery.
@@ -262,7 +264,7 @@ ID next to its best candidate).
 | P1: classroom, one student out of view for 50 s, then back in his seat (frames after the return were never seen before) | return after more than the 30 s window | 4 | 5 | 4 | 1 (`long`, sim 0.939, 0.16 m) | 0 |
 | P2: `one-by-one-person-detection.mp4`, a woman walks out of frame, the room is empty for 60 s, she walks back in through the same edge | walk-out / walk-in | 1 | 3 | 1 (+1 one-frame blip) | 1 (`long`, sim 0.974, 0.09 m) | 0 |
 | P3: classroom, a student stands up, steps into the aisle and sits back down in his own seat; hidden for 43 s while out of his seat | `seat` rule on real footage | 4 | 5 | 4 | 1 (`seat`, gallery sim 0.968, 0.06 m from his home seat) | 0 |
-| N1: `one-by-one-person-detection.mp4` (139 s, unmodified) | 6 **different** people take turns at the same table, 3-54 s apart, two look-alike pairs | 6 | 6 | 6 | 0 | 0 |
+| N1: `one-by-one-person-detection.mp4` (139 s, unmodified) | 6 **different** people take turns standing still at the same table, 3-54 s apart, two look-alike pairs; also the negative `seat` test (each newcomer settles within 0.15 m of the previous people's home seat) | 6 | 6 | 6 | 0 | 0 |
 | N2: `people-detection.mp4` (50 s, unmodified) | 7 different people using the same doors, similar outfits | 7 | 7 | 7 | 0 | 0 |
 
 In P3 the long-absence rule also checked him when he reappeared, but rejected him (0.85 < `LONG_MIN_SIM`; he was
@@ -273,7 +275,19 @@ grey panel) and a looped seated tail are edited.
 
 P1 and P2 are built from real footage; there was no public clip of the same person leaving and returning. P2's
 return is the original walk played in reverse with brighter lighting, so its appearance match is easier than in
-real life. In N1/N2 the closest different-person similarity was 0.80 (well below `LONG_MIN_SIM` = 0.93).
+real life. In N1/N2 the closest different-person similarity was 0.80 for the reappearance rules (well below
+`LONG_MIN_SIM` = 0.93).
+
+The seat rule needed its own threshold. In N1, every newcomer settled in the same spot as someone who had left,
+and the seat rule compared their averaged clothing galleries:
+- most different-person scores were 0.72-0.85;
+- one pair of men in black clothes reached 0.928;
+- the returning student in P3 scored 0.968.
+
+The original shared threshold (0.93) cleared that black-clothes pair by only 0.002, so the seat rule now uses
+`SEAT_MIN_SIM` = 0.95. That doesn't change any test result: P3's merge was logged at 0.968, and every N1 comparison
+was at most 0.928. One positive sample is thin evidence, though; check `closest_seat_rule_candidate` on your own
+footage.
 
 Reference run summary (classroom, first 30 s): raw tracker IDs 4, stable IDs 4, remaps 0, Gemini `id_mismatch`
 flags 0, failed Gemini calls 0 / 0 (disabled).

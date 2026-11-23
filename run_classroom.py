@@ -79,10 +79,12 @@ PENDING_SEC = 3.0                  # new ID whose first crop was occluded/cut of
                                    #   re-tested (same MIN_SIM/MAX_DIST rule) on clean crops; merged if it passes
 PENDING_RETEST_SEC = 0.25          # how often a provisional ID is re-embedded and re-tested
 LONG_ABSENCE_SEC = 600.0           # after REMAP_WINDOW_SEC a missing ID stays reclaimable this long, but only with
-LONG_MIN_SIM = 0.93                #   this stricter similarity AND reappearing where it vanished or in its home seat
+LONG_MIN_SIM = 0.93                #   this stricter similarity AND reappearing within MAX_DIST of where it vanished
 SEAT_DWELL_SEC = 5.0               # staying within SEAT_RADIUS this long marks a seat; longest-held seat = home seat
 SEAT_RADIUS = 0.6                  # m
 SEAT_MATCH_DIST = 0.75             # m: a newcomer settling this close to a missing ID's home seat is compared with it
+SEAT_MIN_SIM = 0.95                # seat rule compares two averaged galleries, which score higher than crop-vs-gallery
+                                   #   for everyone (same person 0.968 vs different people <= 0.928 in tests)
 SEAT_CLAIM_WINDOW_SEC = 180.0      # a newcomer can be merged into a missing ID (seat rule) up to this long after it
                                    #   first appeared
 DRIFT_SIM = 0.80                   # refresh below this sim to its own gallery = "appearance drift": logged, not merged
@@ -533,7 +535,7 @@ class IdentityManager:
       - long rule: missing <= LONG_ABSENCE_SEC, similarity >= LONG_MIN_SIM, and appearing within MAX_DIST of where
         it was last seen (e.g. back through the same door or frame edge);
       - seat rule: a newcomer (first seen <= SEAT_CLAIM_WINDOW_SEC ago) who settles within SEAT_MATCH_DIST of a
-        missing ID's home seat and whose gallery matches with similarity >= LONG_MIN_SIM is merged into it.
+        missing ID's home seat and whose gallery matches with similarity >= SEAT_MIN_SIM is merged into it.
     Multiple new raw IDs in one frame are matched jointly (Hungarian, max similarity); otherwise a new stable ID is
     created. If its first crop was occluded or cut off, it is provisional for PENDING_SEC and re-tested on clean
     crops. One SigLIP forward pass per frame embeds all needed crops."""
@@ -771,7 +773,7 @@ class IdentityManager:
                     if bc is None or sim > bc["similarity"]:
                         young.best_seat_candidate = dict(stable_id=d.sid, similarity=round(sim, 4),
                                                          distance_m=round(dist, 3), t=round(t, 3))
-                    if sim >= LONG_MIN_SIM and (best is None or sim > best[1]):
+                    if sim >= SEAT_MIN_SIM and (best is None or sim > best[1]):
                         best = (d, sim, dist)
             if best is not None:
                 ident, sim, dist = best
