@@ -1,0 +1,5 @@
+stable_id,first_t,last_t,visible_sec,frames,raw_tracker_ids,remaps,total_distance_m,mean_speed_mps,p95_speed_mps,moving_sec,still_sec,mean_floor_x,mean_floor_y,home_seat_x,home_seat_y,sec_at_home_seat,hand_raises,hand_raised_sec,role,top_attention_id,appearance,behavior_sec_listening,behavior_sec_writing,behavior_sec_reading,behavior_sec_using_device,behavior_sec_talking,behavior_sec_hand_raised,behavior_sec_presenting,behavior_sec_walking,behavior_sec_off_task,behavior_sec_other
+1,0.067,29.967,29.93,898,0,0,2.483,0.077,0.527,2.87,16.47,4.85,0.971,4.924,0.936,29.37,1,1.87,,,,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+2,0.067,29.967,29.93,898,1,0,2.013,0.072,0.254,0.97,25.43,5.746,0.087,5.741,0.074,29.93,0,0.0,,,,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+3,0.067,29.967,29.93,898,2,0,0.162,0.031,0.115,0.0,25.43,3.485,1.032,3.491,1.02,29.93,0,0.0,,,,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+4,0.067,29.967,29.93,898,3,0,0.000,0.015,0.033,0.0,25.43,3.407,-0.093,3.407,-0.094,29.93,0,0.0,,,,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0

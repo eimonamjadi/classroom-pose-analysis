@@ -28,6 +28,17 @@ The floor calibration for this clip was estimated by eye, so radar depth is comp
 - `filmstrips_negative_same_spot.jpg` and `filmstrips_negative_same_doors.jpg`: six and seven **different** people
   using the same table / doors keep separate IDs. Nobody inherits the ID of someone who left.
 
+New output types, from the classroom (first 30 s) and the shop aisle (50 s):
+- `skeletons_classroom.mp4`, `skeletons_aisle.mp4`: skeleton-only video with ID labels and fading 10 s trails.
+- `trajectories_floor_*.png`: each ID's path on the floor plan (ring = start, dot = end, square = home seat).
+- `trajectories_camera_*.png`: the same paths drawn over the first frame.
+- `heatmap_floor_*.png`: where people spent their time.
+- `id_summary_*.csv`: one row per ID (time on screen, distance, speeds, moving / still time, home seat, hand
+  raises, Gemini fields when available).
+- `tracks_sample_*.csv`: the first 300 rows of the per-frame CSV (80 columns, including all 17 keypoints).
+
+The floor calibrations for these clips were estimated by eye, so distances and speeds are approximate.
+
 All demos were produced with the current code (default ByteTrack + stable-ID layer).
 
 **Attribution:** source footage is `classroom.mp4`, `store-aisle-detection.mp4`, `worker-zone-detection.mp4`,

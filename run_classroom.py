@@ -302,7 +302,7 @@ class FloorRadar:
         self.scale = min((width - 2 * m) / max(self.x1 - self.x0, 1e-3), (height - 2 * m) / max(self.y1 - self.y0, 1e-3))
         self.ox = (width - self.scale * (self.x1 - self.x0)) / 2
         self.oy = (height - self.scale * (self.y1 - self.y0)) / 2
-        self.fs = max(0.4, height / 700)
+        self.fs = min(max(0.4, height / 700), 0.9)
         self.base = self._background()
 
     def to_px(self, xy) -> tuple[int, int]:
@@ -1278,29 +1278,35 @@ def write_trajectory_maps(rows: list[dict], idm: "IdentityManager", calib: dict,
     radar = FloorRadar(ext, W, int(np.clip(W * aspect, 500, 1600)) + 60)
     paths = []
 
-    def segments(rs, kx, ky):
+    def segments(rs, kx, ky, win=15):
+        """Continuous pieces of a path (split at gaps > 1 s), drawn as a rolling median over `win` frames so that
+        brief ground-point glitches (e.g. while the person is partly hidden) don't draw spikes. Display only."""
         seg, last = [], None
+        def smooth(s):
+            a = np.array(s)
+            h = win // 2
+            return [tuple(np.median(a[max(0, i - h):i + h + 1], axis=0)) for i in range(len(a))]
         for r in rs:
             t = float(r["t"])
             if last is not None and t - last > 1.0 and seg:
-                yield seg
+                yield smooth(seg)
                 seg = []
             seg.append((float(r[kx]), float(r[ky])))
             last = t
         if seg:
-            yield seg
+            yield smooth(seg)
 
     # floor plan
     img = radar.base.copy()
-    put_label(img, "trajectories (floor, m): ring = start, dot = end, square = home seat", (8, 48), (28, 28, 28),
-              radar.fs * 0.8)
+    put_label(img, "trajectories (floor, m): ring = start, dot = end, square = home seat", (8, 52), (28, 28, 28),
+              0.7)
     for sid, rs in sorted(by_sid.items()):
         color = id_color(sid)
-        for seg in segments(rs, "floor_x", "floor_y"):
+        segs = list(segments(rs, "floor_x", "floor_y"))
+        for seg in segs:
             pts = np.array([radar.to_px(p) for p in seg], np.int32)
             cv2.polylines(img, [pts], False, color, 2, cv2.LINE_AA)
-        s = radar.to_px((float(rs[0]["floor_x"]), float(rs[0]["floor_y"])))
-        e = radar.to_px((float(rs[-1]["floor_x"]), float(rs[-1]["floor_y"])))
+        s, e = radar.to_px(segs[0][0]), radar.to_px(segs[-1][-1])
         cv2.circle(img, s, 7, color, 2, cv2.LINE_AA)
         cv2.circle(img, e, 7, color, -1, cv2.LINE_AA)
         home = idm.ids[sid].home_seat if sid in idm.ids else None
@@ -1316,9 +1322,10 @@ def write_trajectory_maps(rows: list[dict], idm: "IdentityManager", calib: dict,
     img = (first_frame * 0.45).astype(np.uint8)
     for sid, rs in sorted(by_sid.items()):
         color = id_color(sid)
-        for seg in segments(rs, "anchor_x", "anchor_y"):
+        segs = list(segments(rs, "anchor_x", "anchor_y"))
+        for seg in segs:
             cv2.polylines(img, [np.array(seg, np.int32)], False, color, max(2, first_frame.shape[0] // 400), cv2.LINE_AA)
-        e = (int(float(rs[-1]["anchor_x"])), int(float(rs[-1]["anchor_y"])))
+        e = (int(segs[-1][-1][0]), int(segs[-1][-1][1]))
         cv2.circle(img, e, 6, color, -1, cv2.LINE_AA)
         put_label(img, f"#{sid}", (e[0] + 8, e[1] - 6), color, max(0.5, first_frame.shape[0] / 1400), 1, (0, 0, 0))
     put_label(img, "movement trajectories (ground point, camera view)", (8, 30), (0, 0, 0),
@@ -1346,7 +1353,7 @@ def write_trajectory_maps(rows: list[dict], idm: "IdentityManager", calib: dict,
         roi = img[y0:y1, x0:x1]
         mask = (hm > 8)[..., None]
         img[y0:y1, x0:x1] = np.where(mask, cv2.addWeighted(roi, 0.3, colored, 0.7, 0), roi)
-        put_label(img, "occupancy heatmap (time spent on the floor)", (8, 48), (28, 28, 28), radar.fs * 0.8)
+        put_label(img, "occupancy heatmap (time spent on the floor)", (8, 52), (28, 28, 28), 0.7)
         p = out_dir / f"{stem}_heatmap_floor.png"
         cv2.imwrite(str(p), img)
         paths.append(p)
