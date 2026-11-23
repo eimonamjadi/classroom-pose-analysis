@@ -1292,7 +1292,7 @@ def write_trajectory_maps(rows: list[dict], idm: "IdentityManager", calib: dict,
 
     # floor plan
     img = radar.base.copy()
-    put_label(img, f"movement trajectories (floor, m)  o start  * end  [] home seat", (8, 48), (28, 28, 28),
+    put_label(img, "trajectories (floor, m): ring = start, dot = end, square = home seat", (8, 48), (28, 28, 28),
               radar.fs * 0.8)
     for sid, rs in sorted(by_sid.items()):
         color = id_color(sid)
