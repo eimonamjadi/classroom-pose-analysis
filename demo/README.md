@@ -22,6 +22,9 @@ The floor calibration for this clip was estimated by eye, so radar depth is comp
   long-absence rule.
 - `demo_reentry_walkout_back60s.mp4`: a woman walks out of frame, the room is empty for 60 s, and she walks back in
   through the same edge. Her temporary ID is merged back into #1 1.2 s after she reappears.
+- `demo_seat_rule_return.mp4` and `filmstrips_seat_rule.jpg`: seat rule on real footage. The hoodie student (#3)
+  leaves his seat at 21 s and is hidden for 43 s. He reappears sitting down, gets a temporary #5, and is merged back
+  into #3 at 69.4 s, 5 s after settling into his home seat.
 - `filmstrips_negative_same_spot.jpg` and `filmstrips_negative_same_doors.jpg`: six and seven **different** people
   using the same table / doors keep separate IDs. Nobody inherits the ID of someone who left.
 

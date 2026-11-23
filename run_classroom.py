@@ -514,6 +514,7 @@ class Identity:
     still_at: Optional[np.ndarray] = None    # where it is currently standing/sitting still, else None
     seats: list = field(default_factory=list)  # [[center xy, dwell seconds], ...]
     last_seat_check_t: float = -1e9
+    best_seat_candidate: Optional[dict] = None  # closest seat-rule comparison seen (for tuning / auditing)
 
     @property
     def home_seat(self) -> Optional[np.ndarray]:
@@ -765,8 +766,13 @@ class IdentityManager:
                     continue
                 dist = float(np.linalg.norm(young.still_at - home))
                 sim = float(d.gallery @ young.gallery)
-                if dist <= SEAT_MATCH_DIST and sim >= LONG_MIN_SIM and (best is None or sim > best[1]):
-                    best = (d, sim, dist)
+                if dist <= SEAT_MATCH_DIST:
+                    bc = young.best_seat_candidate
+                    if bc is None or sim > bc["similarity"]:
+                        young.best_seat_candidate = dict(stable_id=d.sid, similarity=round(sim, 4),
+                                                         distance_m=round(dist, 3), t=round(t, 3))
+                    if sim >= LONG_MIN_SIM and (best is None or sim > best[1]):
+                        best = (d, sim, dist)
             if best is not None:
                 ident, sim, dist = best
                 self._merge(young, ident, int(raw_ids[i]), frame_idx, t, sim, dist, "seat", None)
@@ -1638,6 +1644,7 @@ def main() -> int:
                                        frames_seen=d.frames_seen, raw_ids=d.raw_ids,
                                        home_seat_xy=[round(float(v), 3) for v in d.home_seat]
                                        if d.home_seat is not None else None,
+                                       closest_seat_rule_candidate=d.best_seat_candidate,
                                        appearance=labeler.memory.get(sid) if labeler else None)
                         for sid, d in sorted(idm.ids.items())},
             merged_ids={str(k): idm.resolve(k) for k in idm.merged},  # already applied to tracks CSV/keyframes

@@ -261,8 +261,15 @@ ID next to its best candidate).
 |---|---|---|---|---|---|---|
 | P1: classroom, one student out of view for 50 s, then back in his seat (frames after the return were never seen before) | return after more than the 30 s window | 4 | 5 | 4 | 1 (`long`, sim 0.939, 0.16 m) | 0 |
 | P2: `one-by-one-person-detection.mp4`, a woman walks out of frame, the room is empty for 60 s, she walks back in through the same edge | walk-out / walk-in | 1 | 3 | 1 (+1 one-frame blip) | 1 (`long`, sim 0.974, 0.09 m) | 0 |
+| P3: classroom, a student stands up, steps into the aisle and sits back down in his own seat; hidden for 43 s while out of his seat | `seat` rule on real footage | 4 | 5 | 4 | 1 (`seat`, gallery sim 0.968, 0.06 m from his home seat) | 0 |
 | N1: `one-by-one-person-detection.mp4` (139 s, unmodified) | 6 **different** people take turns at the same table, 3-54 s apart, two look-alike pairs | 6 | 6 | 6 | 0 | 0 |
 | N2: `people-detection.mp4` (50 s, unmodified) | 7 different people using the same doors, similar outfits | 7 | 7 | 7 | 0 | 0 |
+
+In P3 the long-absence rule also checked him when he reappeared, but rejected him (0.85 < `LONG_MIN_SIM`; he was
+mid-sit). He got a temporary ID, and 5 s after he settled into his home seat the seat rule merged it back. A second
+run with the reappearance rules switched off (`--set MAX_DIST=0.01`) gave the same result. His walk, his return
+and the frames after it are real footage; only the 43 s absence (his 5.4 s away from the seat, slowed 8x behind a
+grey panel) and a looped seated tail are edited.
 
 P1 and P2 are built from real footage; there was no public clip of the same person leaving and returning. P2's
 return is the original walk played in reverse with brighter lighting, so its appearance match is easier than in
