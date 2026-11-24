@@ -11,3 +11,4 @@ runs/
 venv/
 .DS_Store
 !demo/*.mp4
+jobs/

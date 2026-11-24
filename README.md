@@ -115,12 +115,56 @@ homography is written instead and a warning is printed. Edit it, because `MAX_DI
 - `<video>_heatmap_floor.png`: where people spent their time on the floor.
 - `vlm_keyframes/`: the exact tagged JPEGs sent to Gemini, for auditing `id_mismatch` flags.
 
+## Web app: upload a video in the browser
+
+`app.py` is a small web page around `run_classroom.py`:
+1. Upload a video.
+2. Optionally click the 4 floor corners on the first frame and type the room size, or upload a saved
+   `floor_calib.json`.
+3. Press **Run analysis**.
+
+It shows live progress, then the annotated video, the skeleton video, the trajectory maps and the per-ID table, plus
+one zip with every output. Jobs run one at a time and earlier results stay listed on the page.
+
+```bash
+pip install -r requirements-app.txt
+```
+
+```bash
+python app.py --password choose-one
+```
+
+The page is at http://localhost:7860; log in as `teacher` with your password. Add `--share` for a temporary public
+link.
+
+Where to host it:
+
+| option | link | cost | notes |
+|---|---|---|---|
+| **Google Colab** (`cloud/run_on_colab.ipynb`, Option A cell) | temporary `*.gradio.live` link | free tier or Colab Pro | the Colab tab must stay open (up to about 72 h); results can be saved to Google Drive |
+| **Hugging Face Space** | permanent, private page | free on CPU (slow); GPU billed per hour while running | set a sleep timeout so an idle GPU stops billing |
+| **Any cloud GPU VM** | your own server | per hour while the VM is on | `python app.py --host 0.0.0.0 --password ...`, behind your own HTTPS / firewall |
+
+Setting up a Hugging Face Space (about 5 minutes):
+1. On huggingface.co, create a **New Space**. Choose SDK **Gradio**, visibility **Private**, and GPU hardware (e.g.
+   T4).
+2. Upload `app.py`, `run_classroom.py` and `requirements.txt`, plus the two files in `cloud/huggingface_space/`:
+   `README.md` (replaces the Space's) and `packages.txt` (ffmpeg and OpenCV system libraries).
+3. In the Space's **Settings, Secrets**, add `GEMINI_API_KEY` and `APP_PASSWORD`.
+4. Open the Space, log in as `teacher`, and upload a video. The app detects that it runs in a Space.
+
+A Space's disk is wiped when it restarts, so download each result zip (or add persistent storage).
+
+**Privacy:** this footage shows students. Check your institution's rules before uploading it to Colab or Hugging
+Face, keep the Space private and password-protected, and delete job folders you no longer need.
+
 ## Running in the cloud
 
 The pipeline runs anywhere Python and (ideally) an NVIDIA GPU are available. On a GPU it is many times faster
 than on CPU.
 
-- **Google Colab (easiest):** open `cloud/run_on_colab.ipynb` in Colab and pick a GPU runtime. Add the secrets
+- **Google Colab:** open `cloud/run_on_colab.ipynb` in Colab and pick a GPU runtime. Option A starts the web
+  app above; Option B processes a Google Drive folder. Add the secrets
   `GEMINI_API_KEY` (and `GITHUB_TOKEN` while this repo is private), point it at a Google Drive folder of videos,
   and run all cells. Outputs go back to Drive. Colab can't open the click-to-calibrate window, so the notebook
   has a cell to enter the 4 floor points instead.
