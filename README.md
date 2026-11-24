@@ -1,5 +1,7 @@
 # classroom-pose-analysis
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/eimonamjadi/classroom-pose-analysis/blob/main/cloud/run_on_colab.ipynb)
+
 Offline analysis of fixed-camera classroom video, in a single script (`run_classroom.py`).
 
 ```
@@ -142,7 +144,7 @@ Where to host it:
 
 | option | link | cost | notes |
 |---|---|---|---|
-| **Google Colab** (`cloud/run_on_colab.ipynb`, Option A cell) | temporary `*.gradio.live` link | free tier or Colab Pro | the Colab tab must stay open (up to about 72 h); results can be saved to Google Drive |
+| **Google Colab** ([open the notebook](https://colab.research.google.com/github/eimonamjadi/classroom-pose-analysis/blob/main/cloud/run_on_colab.ipynb), Option A cell) | temporary `*.gradio.live` link | free tier or Colab Pro | the Colab tab must stay open (up to about 72 h); results can be saved to Google Drive |
 | **Hugging Face Space** | permanent, private page | free on CPU (slow); GPU billed per hour while running | set a sleep timeout so an idle GPU stops billing |
 | **Any cloud GPU VM** | your own server | per hour while the VM is on | `python app.py --host 0.0.0.0 --password ...`, behind your own HTTPS / firewall |
 
@@ -168,10 +170,9 @@ Face, keep the Space private and password-protected, and delete job folders you 
 The pipeline runs anywhere Python and (ideally) an NVIDIA GPU are available. On a GPU it is many times faster
 than on CPU.
 
-- **Google Colab:** open `cloud/run_on_colab.ipynb` in Colab and pick a GPU runtime. Option A starts the web
-  app above; Option B processes a Google Drive folder. Add the secrets
-  `GEMINI_API_KEY` (and `GITHUB_TOKEN` while this repo is private), point it at a Google Drive folder of videos,
-  and run all cells. Outputs go back to Drive. Colab can't open the click-to-calibrate window, so the notebook
+- **Google Colab:** [open the notebook](https://colab.research.google.com/github/eimonamjadi/classroom-pose-analysis/blob/main/cloud/run_on_colab.ipynb) and pick a GPU runtime. Option A starts the web app above;
+  Option B processes a Google Drive folder of videos. Add the secret `GEMINI_API_KEY` for behavior labels. Outputs
+  go back to Drive. Colab can't open the click-to-calibrate window, so the notebook
   has a cell to enter the 4 floor points instead.
 - **Any cloud GPU VM** (Google Cloud, AWS, Azure, Lambda, RunPod, ...) with a recent NVIDIA driver:
 
