@@ -9,7 +9,8 @@ calibrate, press Run, and get the annotated video, skeleton video, trajectory ma
   python app.py --host 0.0.0.0  # on a cloud VM (a Hugging Face Space is detected automatically)
 
 Gemini labels need GEMINI_API_KEY in the environment (a Colab / Space secret). Jobs run one at a time (one GPU);
-each job's outputs are kept under jobs/ (override with CLASSROOM_JOBS_DIR).
+each job's working folder is under jobs/ (CLASSROOM_JOBS_DIR; keep it on a fast local disk). Set
+CLASSROOM_RESULTS_DIR (e.g. a Google Drive folder) to also copy each finished results zip there.
 """
 from __future__ import annotations
 
@@ -31,7 +32,8 @@ import gradio as gr
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-JOBS = Path(os.environ.get("CLASSROOM_JOBS_DIR", ROOT / "jobs"))
+JOBS = Path(os.environ.get("CLASSROOM_JOBS_DIR", ROOT / "jobs"))       # working folders (keep on a fast local disk)
+RESULTS = Path(os.environ["CLASSROOM_RESULTS_DIR"]) if os.environ.get("CLASSROOM_RESULTS_DIR") else None  # zip copies
 CORNERS = ["near-left", "near-right", "far-right", "far-left"]
 
 
@@ -129,6 +131,9 @@ def _finish(job: Path) -> dict:
                 z.write(p, p.relative_to(out))
         z.write(job / "log.txt", "log.txt")
     result["zip"] = str(zip_path)
+    if RESULTS is not None:  # e.g. Google Drive: copy only the finished zip (slow disk)
+        RESULTS.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(zip_path, RESULTS / zip_path.name)
     (job / "result.json").write_text(json.dumps(result))
     return result
 
@@ -171,6 +176,7 @@ def run_job(video, pts, width_m, depth_m, calib_file, max_seconds, tracker, use_
     if not video:
         yield ("Upload a video first.", *empty)
         return
+    yield ("Starting... preparing the job (a large video can take a moment).", *empty)
     stem = Path(video).stem
     job = JOBS / f"{time.strftime('%Y%m%d-%H%M%S')}_{re.sub(r'[^A-Za-z0-9_-]+', '_', stem)[:40]}"
     out = job / "outputs"
@@ -182,16 +188,30 @@ def run_job(video, pts, width_m, depth_m, calib_file, max_seconds, tracker, use_
         shutil.copy2(video, src)
 
     calib = job / "floor_calib.json"
+    pts = pts or []
+    frame = first_frame(str(src))
+    corner_like = False
+    if frame is not None and len(pts) == 4:
+        h, w = frame.shape[:2]
+        corner_like = all(min(x, w - x) < 0.04 * w and min(y, h - y) < 0.04 * h for x, y in pts)
     if calib_file:
         shutil.copy(calib_file, calib)
         calib_note = "floor calibration: uploaded file"
-    elif len(pts) == 4 and width_m and depth_m:
+    elif len(pts) == 4 and width_m and depth_m and width_m > 0 and depth_m > 0:
         calib.write_text(json.dumps({"image_points": pts,
                                      "floor_points": [[0, 0], [width_m, 0], [width_m, depth_m], [0, depth_m]],
                                      "source": "clicked in the web app"}, indent=2))
         calib_note = f"floor calibration: clicked, {width_m} m x {depth_m} m"
+        if corner_like:
+            calib_note += ("\nWARNING: the 4 points are the corners of the image, not of a rectangle on the floor; "
+                           "floor distances will be wrong. Reset and click 4 floor points, or skip calibration.")
+    elif len(pts) == 4:
+        calib_note = ("floor calibration: NOT USED: 4 points were clicked but the rectangle's width / depth are empty "
+                      "or 0. Using a rough default; distances are approximate.")
+    elif pts:
+        calib_note = f"floor calibration: NOT USED: only {len(pts)} of 4 points clicked. Using a rough default."
     else:
-        calib_note = "floor calibration: NONE (rough default; distances will be approximate)"
+        calib_note = "floor calibration: none (rough default; distances will be approximate)"
 
     cmd = [sys.executable, str(ROOT / "run_classroom.py"), "--video", str(src), "--out", str(out),
            "--calib", str(calib), "--tracker", tracker] + parse_overrides(overrides)
@@ -234,8 +254,10 @@ def run_job(video, pts, width_m, depth_m, calib_file, max_seconds, tracker, use_
 
 
 def past_results():
-    zips = sorted(JOBS.glob("*/*_results.zip"), reverse=True)
-    return [str(p) for p in zips[:20]] or None
+    zips = {p.name: p for p in JOBS.glob("*/*_results.zip")}
+    if RESULTS is not None and RESULTS.exists():
+        zips.update({p.name: p for p in RESULTS.glob("*_results.zip") if p.name not in zips})
+    return [str(zips[k]) for k in sorted(zips, reverse=True)[:20]] or None
 
 
 def jobs_status():
@@ -265,6 +287,8 @@ def build_ui() -> gr.Blocks:
                     overrides = gr.Textbox(label="Advanced overrides (NAME=VALUE, comma separated)",
                                            placeholder="MIN_SIM=0.88, SEAT_MIN_SIM=0.95")
                 run = gr.Button("3. Run analysis", variant="primary")
+                log = gr.Textbox(label="Progress", lines=14, max_lines=14, autoscroll=True,
+                                 placeholder="Progress appears here after you press Run.")
             with gr.Column(scale=1):
                 gr.Markdown("### 2. Floor calibration (optional, once per camera)")
                 calib_md = gr.Markdown("Upload a video first.")
@@ -276,7 +300,6 @@ def build_ui() -> gr.Blocks:
                     reset = gr.Button("Reset points")
                 calib_file = gr.File(label="...or upload an existing floor_calib.json", file_types=[".json"],
                                      type="filepath")
-        log = gr.Textbox(label="Progress", lines=14, max_lines=14, autoscroll=True)
         with gr.Row():
             annotated = gr.Video(label="Annotated video (with floor radar)")
             skeleton = gr.Video(label="Skeleton video")
