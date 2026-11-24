@@ -124,7 +124,8 @@ homography is written instead and a warning is printed. Edit it, because `MAX_DI
 3. Press **Run analysis**.
 
 It shows live progress, then the annotated video, the skeleton video, the trajectory maps and the per-ID table, plus
-one zip with every output. Jobs run one at a time and earlier results stay listed on the page.
+one zip with every output. Jobs run in the background, one at a time. You can close the tab after pressing Run, and
+the finished zip appears under **Results from earlier runs** when you come back.
 
 ```bash
 pip install -r requirements-app.txt
@@ -153,7 +154,11 @@ Setting up a Hugging Face Space (about 5 minutes):
 3. In the Space's **Settings, Secrets**, add `GEMINI_API_KEY` and `APP_PASSWORD`.
 4. Open the Space, log in as `teacher`, and upload a video. The app detects that it runs in a Space.
 
-A Space's disk is wiped when it restarts, so download each result zip (or add persistent storage).
+A Space's disk is wiped when it restarts, so download each result zip. If you add persistent storage, also add
+the Space variable `CLASSROOM_JOBS_DIR=/data/jobs` so results land on it.
+
+On paid hardware, set the Space's sleep time longer than your longest job. A Space that goes to sleep while nobody
+has it open stops the job that was running.
 
 **Privacy:** this footage shows students. Check your institution's rules before uploading it to Colab or Hugging
 Face, keep the Space private and password-protected, and delete job folders you no longer need.

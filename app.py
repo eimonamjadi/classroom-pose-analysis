@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -100,6 +101,71 @@ def parse_overrides(text: str) -> list[str]:
     return args
 
 
+JOB_LOCK = threading.Lock()   # one analysis at a time (one GPU); later jobs wait their turn
+NOISE = ("Warning", "Loading weights", "Downloading", "warn(")
+
+
+def _finish(job: Path) -> dict:
+    """After the analysis: browser-playable videos, summary table, one zip with everything."""
+    out = job / "outputs"
+    annotated = next(out.glob("*_annotated.mp4"), None)
+    skeleton = next(out.glob("*_skeletons.mp4"), None)
+    result = dict(annotated=str(to_h264(annotated, job / "annotated_web.mp4")) if annotated else None,
+                  skeleton=str(to_h264(skeleton, job / "skeletons_web.mp4")) if skeleton else None,
+                  gallery=[str(p) for p in sorted(out.glob("*.png"))], table=None)
+    summary_csv = next(out.glob("*_id_summary.csv"), None)
+    if summary_csv:
+        with open(summary_csv, newline="") as fh:
+            rows = list(csv.reader(fh))
+        keep = ["stable_id", "visible_sec", "total_distance_m", "mean_speed_mps", "moving_sec", "still_sec",
+                "sec_at_home_seat", "hand_raises", "role", "remaps"]
+        idx = [rows[0].index(k) for k in keep if k in rows[0]]
+        result["table"] = [[rows[0][i] for i in idx]] + [[r[i] for i in idx] for r in rows[1:]]
+    (job / "log.txt").write_text((job / "info.txt").read_text() + (job / "run.log").read_text())
+    zip_path = job / f"{job.name}_results.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(out.rglob("*")):
+            if p.is_file():
+                z.write(p, p.relative_to(out))
+        z.write(job / "log.txt", "log.txt")
+    result["zip"] = str(zip_path)
+    (job / "result.json").write_text(json.dumps(result))
+    return result
+
+
+def _worker(job: Path, cmd: list[str]) -> None:
+    """Runs in a background thread, so the job keeps going if the browser tab is closed."""
+    status = job / "status.txt"
+    with JOB_LOCK:
+        status.write_text("running")
+        with open(job / "run.log", "w") as logf:
+            rc = subprocess.Popen(cmd, cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT, text=True).wait()
+        if rc != 0:
+            status.write_text(f"failed (exit code {rc})")
+            return
+        status.write_text("finishing")
+        try:
+            _finish(job)
+            status.write_text("done")
+        except Exception as e:  # keep the outputs folder even if packaging fails
+            status.write_text(f"failed while packaging results: {e}")
+
+
+def _log_text(job: Path, n_frames: int, tail: int = 40) -> str:
+    info = (job / "info.txt").read_text()
+    lines = []
+    if (job / "run.log").exists():
+        for line in (job / "run.log").read_text(errors="replace").splitlines():
+            line = line.rstrip()
+            if not line or any(k in line for k in NOISE):
+                continue
+            m = re.search(r"\[progress\] frame (\d+)", line)
+            if m and n_frames:
+                line += f"   ({100 * int(m.group(1)) / n_frames:.0f}%)"
+            lines.append(line)
+    return info + "\n".join(lines[-tail:])
+
+
 def run_job(video, pts, width_m, depth_m, calib_file, max_seconds, tracker, use_gemini, overrides):
     empty = (None, None, [], None, None)
     if not video:
@@ -109,6 +175,11 @@ def run_job(video, pts, width_m, depth_m, calib_file, max_seconds, tracker, use_
     job = JOBS / f"{time.strftime('%Y%m%d-%H%M%S')}_{re.sub(r'[^A-Za-z0-9_-]+', '_', stem)[:40]}"
     out = job / "outputs"
     out.mkdir(parents=True, exist_ok=True)
+    src = job / ("input" + Path(video).suffix.lower())
+    try:
+        os.link(video, src)        # keep the upload with the job (no copy when on the same disk)
+    except OSError:
+        shutil.copy2(video, src)
 
     calib = job / "floor_calib.json"
     if calib_file:
@@ -122,73 +193,58 @@ def run_job(video, pts, width_m, depth_m, calib_file, max_seconds, tracker, use_
     else:
         calib_note = "floor calibration: NONE (rough default; distances will be approximate)"
 
-    cmd = [sys.executable, str(ROOT / "run_classroom.py"), "--video", video, "--out", str(out), "--calib", str(calib),
-           "--tracker", tracker] + parse_overrides(overrides)
+    cmd = [sys.executable, str(ROOT / "run_classroom.py"), "--video", str(src), "--out", str(out),
+           "--calib", str(calib), "--tracker", tracker] + parse_overrides(overrides)
     if max_seconds and max_seconds > 0:
         cmd += ["--max-seconds", str(max_seconds)]
     gemini_ready = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
     if not use_gemini:
         cmd.append("--no-vlm")
 
-    cap = cv2.VideoCapture(video)
+    cap = cv2.VideoCapture(str(src))
     fps, n_frames = cap.get(cv2.CAP_PROP_FPS) or 30.0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     if max_seconds and max_seconds > 0:
         n_frames = min(n_frames, int(max_seconds * fps))
+    gemini = ("on" if use_gemini and gemini_ready else "off" if not use_gemini
+              else "requested but no GEMINI_API_KEY is set: skipped")
+    (job / "info.txt").write_text(f"job: {job.name}\n{calib_note}\nGemini: {gemini}\nframes to process: {n_frames}\n"
+                                  "You can close this tab: the job keeps running, and its zip appears under "
+                                  "'Results from earlier runs' when it is done.\n\n")
+    (job / "status.txt").write_text("queued")
+    threading.Thread(target=_worker, args=(job, cmd), daemon=True).start()
 
-    head = [f"job: {job.name}", calib_note,
-            "Gemini: " + ("on" if use_gemini and gemini_ready else
-                          "off" if not use_gemini else "requested but no GEMINI_API_KEY is set: skipped"),
-            f"frames to process: {n_frames}", ""]
-    lines: list[str] = []
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    last = 0.0
-    for line in proc.stdout:
-        line = line.rstrip()
-        if not line or "Warning" in line or "Loading weights" in line or "Downloading" in line:
-            continue
-        lines.append(line)
-        m = re.search(r"\[progress\] frame (\d+)", line)
-        if m and n_frames:
-            lines[-1] += f"   ({100 * int(m.group(1)) / n_frames:.0f}%)"
-        if time.time() - last > 0.5:
-            last = time.time()
-            yield ("\n".join(head + lines[-40:]), *empty)
-    proc.wait()
-    log = "\n".join(head + lines[-200:])
-    (job / "log.txt").write_text("\n".join(head + lines))
-    if proc.returncode != 0:
-        yield (log + f"\n\nFAILED (exit code {proc.returncode})", *empty)
-        return
-
-    annotated = next(out.glob("*_annotated.mp4"), None)
-    skeleton = next(out.glob("*_skeletons.mp4"), None)
-    ann_web = to_h264(annotated, job / "annotated_web.mp4") if annotated else None
-    skel_web = to_h264(skeleton, job / "skeletons_web.mp4") if skeleton else None
-    gallery = [str(p) for p in sorted(out.glob("*.png"))]
-    table = None
-    summary_csv = next(out.glob("*_id_summary.csv"), None)
-    if summary_csv:
-        with open(summary_csv, newline="") as fh:
-            rows = list(csv.reader(fh))
-        keep = ["stable_id", "visible_sec", "total_distance_m", "mean_speed_mps", "moving_sec", "still_sec",
-                "sec_at_home_seat", "hand_raises", "role", "remaps"]
-        idx = [rows[0].index(k) for k in keep if k in rows[0]]
-        table = [[rows[0][i] for i in idx]] + [[r[i] for i in idx] for r in rows[1:]]
-    zip_path = job / f"{job.name}_results.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in sorted(out.rglob("*")):
-            if p.is_file():
-                z.write(p, p.relative_to(out))
-        z.write(job / "log.txt", "log.txt")
-    df = gr.Dataframe(value=table[1:], headers=table[0]) if table else None
-    yield (log + "\n\nDONE. Download everything as one zip below.", str(ann_web) if ann_web else None,
-           str(skel_web) if skel_web else None, gallery, df, str(zip_path))
+    while True:
+        status = (job / "status.txt").read_text().strip()
+        log = _log_text(job, n_frames)
+        if status == "queued":
+            yield (log + "waiting for the previous job to finish...", *empty)
+        elif status == "done":
+            r = json.loads((job / "result.json").read_text())
+            df = gr.Dataframe(value=r["table"][1:], headers=r["table"][0]) if r["table"] else None
+            yield (_log_text(job, n_frames, tail=200) + "\n\nDONE. Download everything as one zip below.",
+                   r["annotated"], r["skeleton"], r["gallery"], df, r["zip"])
+            return
+        elif status.startswith("failed"):
+            yield (_log_text(job, n_frames, tail=200) + f"\n\nFAILED: {status}", *empty)
+            return
+        else:
+            yield (log, *empty)
+        time.sleep(1.0)
 
 
 def past_results():
     zips = sorted(JOBS.glob("*/*_results.zip"), reverse=True)
     return [str(p) for p in zips[:20]] or None
+
+
+def jobs_status():
+    rows = []
+    for st in sorted(JOBS.glob("*/status.txt"), reverse=True)[:20]:
+        s = st.read_text().strip()
+        if s != "done":
+            rows.append(f"- `{st.parent.name}`: {s}")
+    return "Unfinished jobs:\n" + "\n".join(rows) if rows else "No jobs running."
 
 
 # ------------------------------------------------------------------ UI
@@ -227,8 +283,9 @@ def build_ui() -> gr.Blocks:
         gallery = gr.Gallery(label="Trajectory maps and heatmap", columns=3, height="auto")
         table = gr.Dataframe(label="Per-ID summary (full table in the zip)")
         results = gr.File(label="Download all results (zip)")
-        with gr.Accordion("Results from earlier runs", open=False):
-            past = gr.File(label="Earlier result zips", file_count="multiple")
+        with gr.Accordion("Results from earlier runs (also for jobs started before you closed the tab)", open=False):
+            job_md = gr.Markdown()
+            past = gr.File(label="Finished result zips", file_count="multiple")
             refresh = gr.Button("Refresh list")
 
         video.change(on_video, video, [calib_img, frame_state, pts_state, calib_md])
@@ -236,8 +293,8 @@ def build_ui() -> gr.Blocks:
         reset.click(on_reset, frame_state, [calib_img, pts_state, calib_md])
         run.click(run_job, [video, pts_state, width_m, depth_m, calib_file, max_seconds, tracker, use_gemini,
                             overrides], [log, annotated, skeleton, gallery, table, results])
-        refresh.click(past_results, None, past)
-        demo.load(past_results, None, past)
+        refresh.click(past_results, None, past).then(jobs_status, None, job_md)
+        demo.load(past_results, None, past).then(jobs_status, None, job_md)
     return demo
 
 
